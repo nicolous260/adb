@@ -13,13 +13,21 @@ Run:  python adb_transfer.py
 
 import os
 import queue
+import secrets
 import shlex
 import shutil
+import string
 import subprocess
 import sys
 import threading
+import time
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
+
+try:  # optional: only needed for the "Scan QR" pairing window
+    import qrcode
+except ImportError:  # pragma: no cover
+    qrcode = None
 
 APP_TITLE = "ADB File Transfer"
 DEFAULT_DEST = "/sdcard/Download/"
@@ -34,6 +42,10 @@ PRESETS = [
 
 # Hide the console window that would flash on Windows for each adb call.
 CREATE_NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0
+
+# Make adb use its built-in mDNS so the QR pairing can discover the phone
+# (needed on Windows when Bonjour isn't installed).
+ADB_ENV = dict(os.environ, ADB_MDNS_OPENSCREEN="1")
 
 
 def human_size(n):
@@ -60,8 +72,8 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title(APP_TITLE)
-        self.geometry("760x640")
-        self.minsize(680, 560)
+        self.geometry("880x660")
+        self.minsize(820, 580)
 
         self.adb_path = tk.StringVar(value=shutil.which("adb") or "")
         self.device_var = tk.StringVar()
@@ -104,6 +116,9 @@ class App(tk.Tk):
         )
         self.device_combo.pack(side="left", fill="x", expand=True, padx=6, pady=6)
         ttk.Button(f_dev, text="Refresh", command=self.refresh_devices).pack(
+            side="left", padx=(0, 6)
+        )
+        ttk.Button(f_dev, text="Scan QR (Wi-Fi)", command=self.qr_connect).pack(
             side="left", padx=(0, 6)
         )
 
@@ -217,6 +232,7 @@ class App(tk.Tk):
             capture_output=True,
             text=True,
             timeout=timeout,
+            env=ADB_ENV,
             creationflags=CREATE_NO_WINDOW,
         )
 
@@ -283,6 +299,185 @@ class App(tk.Tk):
         except Exception as e:
             self.log_write(f"[error] {e}")
         self.refresh_devices()
+
+    # --------------------------------------------------------- QR pairing
+    def qr_connect(self):
+        """Show a QR code; scan it from Developer options -> Wireless debugging
+        -> Pair device with QR code. Then pair + connect automatically."""
+        if qrcode is None:
+            messagebox.showerror(
+                APP_TITLE,
+                "QR support needs the 'qrcode' package.\n\nInstall it with:\n    pip install qrcode",
+            )
+            return
+        try:
+            adb = self.adb()
+        except FileNotFoundError as e:
+            messagebox.showerror(APP_TITLE, str(e))
+            return
+
+        name = "ADB_" + "".join(
+            secrets.choice(string.ascii_uppercase + string.digits) for _ in range(6)
+        )
+        password = "".join(secrets.choice(string.digits) for _ in range(8))
+        qr_text = f"WIFI:T:ADB;S:{name};P:{password};;"
+
+        qr = qrcode.QRCode(error_correction=qrcode.constants.ERROR_CORRECT_M, border=0)
+        qr.add_data(qr_text)
+        qr.make(fit=True)
+        matrix = qr.get_matrix()
+        n = len(matrix)
+        quiet = 4
+        cell = max(4, 300 // (n + 2 * quiet))
+        size = (n + 2 * quiet) * cell
+
+        win = tk.Toplevel(self)
+        win.title("Connect by QR code")
+        win.resizable(False, False)
+        win.transient(self)
+
+        ttk.Label(
+            win,
+            text=(
+                "On your phone open:\n"
+                "Settings > Developer options > Wireless debugging\n"
+                "> Pair device with QR code, and scan this code.\n"
+                "(Phone and PC must be on the same Wi-Fi.)"
+            ),
+            justify="center",
+        ).pack(padx=14, pady=(14, 6))
+
+        canvas = tk.Canvas(win, width=size, height=size, bg="white", highlightthickness=0)
+        canvas.pack(padx=14, pady=6)
+        for r, row in enumerate(matrix):
+            for c, filled in enumerate(row):
+                if filled:
+                    x, y = (c + quiet) * cell, (r + quiet) * cell
+                    canvas.create_rectangle(x, y, x + cell, y + cell, fill="black", outline="")
+
+        status = tk.StringVar(value="Waiting for the phone to scan...")
+        ttk.Label(win, textvariable=status, wraplength=max(size, 320), justify="center").pack(
+            padx=14, pady=6
+        )
+
+        cancel = threading.Event()
+        qq = queue.Queue()
+
+        def close():
+            cancel.set()
+            try:
+                win.destroy()
+            except tk.TclError:
+                pass
+
+        btn = ttk.Button(win, text="Cancel", command=close)
+        btn.pack(pady=(0, 14))
+        win.protocol("WM_DELETE_WINDOW", close)
+
+        def poll():
+            try:
+                if not win.winfo_exists():
+                    return
+                while True:
+                    msg = qq.get_nowait()
+                    if msg[0] == "status":
+                        status.set(msg[1])
+                    elif msg[0] == "log":
+                        self.log_write(msg[1])
+                    elif msg[0] == "done":
+                        _kind, ok, text = msg
+                        status.set(text)
+                        self.log_write(text)
+                        self.refresh_devices()
+                        if ok:
+                            win.after(1500, close)
+                        else:
+                            btn.config(text="Close")
+                        return
+            except queue.Empty:
+                pass
+            except tk.TclError:
+                return
+            win.after(200, poll)
+
+        win.after(200, poll)
+        threading.Thread(
+            target=self._qr_worker, args=(adb, name, password, cancel, qq), daemon=True
+        ).start()
+
+    def _qr_worker(self, adb, name, password, cancel, qq):
+        def run(args, timeout=20):
+            return subprocess.run(
+                [adb] + args,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                env=ADB_ENV,
+                creationflags=CREATE_NO_WINDOW,
+            )
+
+        def services():
+            out = run(["mdns", "services"], 10).stdout
+            found = []
+            for line in out.splitlines():
+                parts = line.split()
+                if len(parts) >= 3 and "_adb" in parts[1]:
+                    found.append((parts[0], parts[1], parts[-1]))
+            return found
+
+        try:
+            run(["start-server"], 30)
+
+            pair_addr = None
+            deadline = time.time() + 180
+            while time.time() < deadline and not cancel.is_set():
+                for sname, stype, addr in services():
+                    if "pairing" in stype and sname == name:
+                        pair_addr = addr
+                        break
+                if pair_addr:
+                    break
+                time.sleep(1.5)
+            if cancel.is_set():
+                return
+            if not pair_addr:
+                qq.put((
+                    "done", False,
+                    "Timed out waiting for the phone. Make sure Wireless debugging is on, "
+                    "both devices share the same Wi-Fi, then try again.",
+                ))
+                return
+
+            qq.put(("status", "Phone found - pairing..."))
+            r = run(["pair", pair_addr, password], 30)
+            text = (r.stdout + r.stderr).strip()
+            qq.put(("log", text))
+            if "successfully paired" not in text.lower():
+                qq.put(("done", False, f"Pairing failed: {text or 'no response from adb'}"))
+                return
+
+            qq.put(("status", "Paired - connecting..."))
+            host = pair_addr.rsplit(":", 1)[0]
+            for _ in range(10):
+                if cancel.is_set():
+                    return
+                for _sname, stype, addr in services():
+                    if "connect" in stype and addr.startswith(host + ":"):
+                        r = run(["connect", addr], 15)
+                        out = (r.stdout + r.stderr).strip()
+                        qq.put(("log", out))
+                        if "connected" in out.lower():
+                            qq.put(("done", True, f"Connected to {addr}"))
+                            return
+                time.sleep(1.5)
+
+            qq.put((
+                "done", False,
+                "Paired, but the phone's connect address wasn't found. Enter the IP:port shown "
+                "on the Wireless debugging screen and press 'Connect (Wi-Fi)'.",
+            ))
+        except Exception as e:  # noqa: BLE001
+            qq.put(("done", False, f"Error: {e}"))
 
     # ----------------------------------------------------------- file list
     def _add_paths(self, paths):
