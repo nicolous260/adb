@@ -1,0 +1,441 @@
+#!/usr/bin/env python3
+"""
+ADB File Transfer - a small desktop window app to push files/folders from
+your PC to an Android phone using adb.
+
+Requirements:
+  * Python 3.8+ (tkinter is included with the standard installer)
+  * adb (Android platform-tools) on PATH, or browse to adb.exe in the app
+  * On the phone: Developer options -> USB debugging enabled
+
+Run:  python adb_transfer.py
+"""
+
+import os
+import queue
+import shlex
+import shutil
+import subprocess
+import sys
+import threading
+import tkinter as tk
+from tkinter import filedialog, messagebox, ttk
+
+APP_TITLE = "ADB File Transfer"
+DEFAULT_DEST = "/sdcard/Download/"
+PRESETS = [
+    "/sdcard/Download/",
+    "/sdcard/DCIM/",
+    "/sdcard/Pictures/",
+    "/sdcard/Movies/",
+    "/sdcard/Music/",
+    "/sdcard/Documents/",
+]
+
+# Hide the console window that would flash on Windows for each adb call.
+CREATE_NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0
+
+
+def human_size(n):
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024 or unit == "TB":
+            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1024
+
+
+def path_size(path):
+    if os.path.isfile(path):
+        return os.path.getsize(path)
+    total = 0
+    for root, _dirs, files in os.walk(path):
+        for f in files:
+            try:
+                total += os.path.getsize(os.path.join(root, f))
+            except OSError:
+                pass
+    return total
+
+
+class App(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title(APP_TITLE)
+        self.geometry("760x640")
+        self.minsize(680, 560)
+
+        self.adb_path = tk.StringVar(value=shutil.which("adb") or "")
+        self.device_var = tk.StringVar()
+        self.dest_var = tk.StringVar(value=DEFAULT_DEST)
+        self.wifi_var = tk.StringVar()
+        self.status_var = tk.StringVar(value="Ready")
+
+        self.items = []  # absolute paths to transfer
+        self.devices = {}  # display label -> serial
+        self.q = queue.Queue()
+        self.worker = None
+        self.proc = None
+        self.cancel_flag = threading.Event()
+
+        self._build_ui()
+        self.after(100, self._drain_queue)
+        self.after(300, self.refresh_devices)
+
+    # ------------------------------------------------------------------ UI
+    def _build_ui(self):
+        pad = {"padx": 8, "pady": 4}
+        root = ttk.Frame(self, padding=8)
+        root.pack(fill="both", expand=True)
+
+        # ADB location
+        f_adb = ttk.LabelFrame(root, text="ADB")
+        f_adb.pack(fill="x", **pad)
+        ttk.Entry(f_adb, textvariable=self.adb_path).pack(
+            side="left", fill="x", expand=True, padx=6, pady=6
+        )
+        ttk.Button(f_adb, text="Browse…", command=self.browse_adb).pack(
+            side="left", padx=(0, 6)
+        )
+
+        # Device
+        f_dev = ttk.LabelFrame(root, text="Device")
+        f_dev.pack(fill="x", **pad)
+        self.device_combo = ttk.Combobox(
+            f_dev, textvariable=self.device_var, state="readonly"
+        )
+        self.device_combo.pack(side="left", fill="x", expand=True, padx=6, pady=6)
+        ttk.Button(f_dev, text="Refresh", command=self.refresh_devices).pack(
+            side="left", padx=(0, 6)
+        )
+
+        f_wifi = ttk.Frame(f_dev)
+        f_wifi.pack(side="left", padx=(0, 6))
+        ttk.Entry(f_wifi, textvariable=self.wifi_var, width=20).pack(side="left")
+        ttk.Button(f_wifi, text="Connect (Wi-Fi)", command=self.wifi_connect).pack(
+            side="left", padx=(4, 0)
+        )
+        self._placeholder(self.wifi_var, "192.168.1.5:5555")
+
+        # Files
+        f_files = ttk.LabelFrame(root, text="Files to send")
+        f_files.pack(fill="both", expand=True, **pad)
+
+        btns = ttk.Frame(f_files)
+        btns.pack(fill="x", padx=6, pady=(6, 0))
+        ttk.Button(btns, text="Add files…", command=self.add_files).pack(side="left")
+        ttk.Button(btns, text="Add folder…", command=self.add_folder).pack(
+            side="left", padx=4
+        )
+        ttk.Button(btns, text="Remove selected", command=self.remove_selected).pack(
+            side="left"
+        )
+        ttk.Button(btns, text="Clear", command=self.clear_items).pack(
+            side="left", padx=4
+        )
+        self.count_lbl = ttk.Label(btns, text="0 items")
+        self.count_lbl.pack(side="right")
+
+        list_wrap = ttk.Frame(f_files)
+        list_wrap.pack(fill="both", expand=True, padx=6, pady=6)
+        self.listbox = tk.Listbox(list_wrap, selectmode="extended", activestyle="none")
+        sb = ttk.Scrollbar(list_wrap, orient="vertical", command=self.listbox.yview)
+        self.listbox.configure(yscrollcommand=sb.set)
+        self.listbox.pack(side="left", fill="both", expand=True)
+        sb.pack(side="right", fill="y")
+        self.listbox.bind("<Delete>", lambda _e: self.remove_selected())
+
+        # Destination
+        f_dest = ttk.LabelFrame(root, text="Destination folder on phone")
+        f_dest.pack(fill="x", **pad)
+        self.dest_combo = ttk.Combobox(f_dest, textvariable=self.dest_var, values=PRESETS)
+        self.dest_combo.pack(fill="x", padx=6, pady=6)
+
+        # Transfer controls
+        f_go = ttk.Frame(root)
+        f_go.pack(fill="x", **pad)
+        self.send_btn = ttk.Button(f_go, text="Send to phone", command=self.start_transfer)
+        self.send_btn.pack(side="left")
+        self.cancel_btn = ttk.Button(
+            f_go, text="Cancel", command=self.cancel_transfer, state="disabled"
+        )
+        self.cancel_btn.pack(side="left", padx=6)
+        self.progress = ttk.Progressbar(f_go, mode="determinate")
+        self.progress.pack(side="left", fill="x", expand=True, padx=6)
+        ttk.Label(root, textvariable=self.status_var).pack(anchor="w", padx=10)
+
+        # Log
+        f_log = ttk.LabelFrame(root, text="Log")
+        f_log.pack(fill="both", expand=True, **pad)
+        self.log = tk.Text(f_log, height=8, state="disabled", wrap="word")
+        lsb = ttk.Scrollbar(f_log, orient="vertical", command=self.log.yview)
+        self.log.configure(yscrollcommand=lsb.set)
+        self.log.pack(side="left", fill="both", expand=True, padx=(6, 0), pady=6)
+        lsb.pack(side="right", fill="y", pady=6, padx=(0, 6))
+
+    def _placeholder(self, var, text):
+        # Simple hint text for the Wi-Fi entry (cleared on focus).
+        var.set(text)
+        self._wifi_hint = text
+
+        def clear_hint(_e=None):
+            if var.get() == text:
+                var.set("")
+
+        # Bind on the widget lazily after UI is built.
+        def bind_later():
+            for widget in self._iter_widgets(self):
+                if isinstance(widget, ttk.Entry) and widget.cget("textvariable") == str(var):
+                    widget.bind("<FocusIn>", clear_hint)
+                    break
+
+        self.after(50, bind_later)
+
+    def _iter_widgets(self, w):
+        for c in w.winfo_children():
+            yield c
+            yield from self._iter_widgets(c)
+
+    # ------------------------------------------------------------- helpers
+    def log_write(self, msg):
+        self.log.configure(state="normal")
+        self.log.insert("end", msg.rstrip("\n") + "\n")
+        self.log.see("end")
+        self.log.configure(state="disabled")
+
+    def adb(self):
+        path = self.adb_path.get().strip()
+        if not path or not (os.path.isfile(path) or shutil.which(path)):
+            raise FileNotFoundError(
+                "adb not found. Install Android platform-tools and add it to PATH, "
+                "or use Browse… to pick adb(.exe)."
+            )
+        return path
+
+    def run_adb(self, args, timeout=30):
+        cmd = [self.adb()] + args
+        return subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            creationflags=CREATE_NO_WINDOW,
+        )
+
+    def selected_serial(self):
+        return self.devices.get(self.device_var.get())
+
+    # ---------------------------------------------------------- ADB / device
+    def browse_adb(self):
+        p = filedialog.askopenfilename(title="Select adb executable")
+        if p:
+            self.adb_path.set(p)
+            self.refresh_devices()
+
+    def refresh_devices(self):
+        try:
+            res = self.run_adb(["devices", "-l"])
+        except Exception as e:
+            self.device_combo["values"] = []
+            self.device_var.set("")
+            self.devices = {}
+            self.status_var.set(str(e))
+            self.log_write(f"[error] {e}")
+            return
+
+        self.devices = {}
+        unauthorized = []
+        for line in res.stdout.splitlines()[1:]:
+            parts = line.split()
+            if len(parts) < 2:
+                continue
+            serial, state = parts[0], parts[1]
+            if state == "device":
+                model = ""
+                for p in parts[2:]:
+                    if p.startswith("model:"):
+                        model = p.split(":", 1)[1]
+                label = f"{model or 'Android device'}  ({serial})"
+                self.devices[label] = serial
+            elif state == "unauthorized":
+                unauthorized.append(serial)
+
+        labels = list(self.devices)
+        self.device_combo["values"] = labels
+        if labels:
+            if self.device_var.get() not in labels:
+                self.device_var.set(labels[0])
+            self.status_var.set(f"{len(labels)} device(s) connected")
+        else:
+            self.device_var.set("")
+            msg = "No device found. Plug in the phone and enable USB debugging."
+            if unauthorized:
+                msg = "Device is unauthorized - accept the 'Allow USB debugging' prompt on the phone."
+            self.status_var.set(msg)
+            self.log_write(f"[info] {msg}")
+
+    def wifi_connect(self):
+        addr = self.wifi_var.get().strip()
+        if not addr or addr == getattr(self, "_wifi_hint", ""):
+            messagebox.showinfo(APP_TITLE, "Enter the phone's IP:port first, e.g. 192.168.1.5:5555")
+            return
+        try:
+            res = self.run_adb(["connect", addr], timeout=15)
+            self.log_write((res.stdout + res.stderr).strip())
+        except Exception as e:
+            self.log_write(f"[error] {e}")
+        self.refresh_devices()
+
+    # ----------------------------------------------------------- file list
+    def _add_paths(self, paths):
+        for p in paths:
+            p = os.path.abspath(p)
+            if p not in self.items:
+                self.items.append(p)
+                kind = "📁" if os.path.isdir(p) else "📄"
+                self.listbox.insert("end", f"{kind} {p}")
+        self._update_count()
+
+    def _update_count(self):
+        self.count_lbl.config(text=f"{len(self.items)} item(s)")
+
+    def add_files(self):
+        paths = filedialog.askopenfilenames(title="Choose files to send")
+        if paths:
+            self._add_paths(paths)
+
+    def add_folder(self):
+        p = filedialog.askdirectory(title="Choose a folder to send")
+        if p:
+            self._add_paths([p])
+
+    def remove_selected(self):
+        for idx in reversed(self.listbox.curselection()):
+            self.listbox.delete(idx)
+            del self.items[idx]
+        self._update_count()
+
+    def clear_items(self):
+        self.listbox.delete(0, "end")
+        self.items.clear()
+        self._update_count()
+
+    # ------------------------------------------------------------ transfer
+    def start_transfer(self):
+        if self.worker and self.worker.is_alive():
+            return
+        if not self.items:
+            messagebox.showinfo(APP_TITLE, "Add at least one file or folder first.")
+            return
+        serial = self.selected_serial()
+        if not serial:
+            self.refresh_devices()
+            serial = self.selected_serial()
+            if not serial:
+                messagebox.showerror(APP_TITLE, "No connected device selected.")
+                return
+        dest = self.dest_var.get().strip() or DEFAULT_DEST
+        if not dest.endswith("/"):
+            dest += "/"
+        try:
+            adb = self.adb()
+        except FileNotFoundError as e:
+            messagebox.showerror(APP_TITLE, str(e))
+            return
+
+        self.cancel_flag.clear()
+        self.send_btn.config(state="disabled")
+        self.cancel_btn.config(state="normal")
+        self.progress.config(value=0, maximum=len(self.items))
+        items = list(self.items)
+        self.worker = threading.Thread(
+            target=self._transfer_worker, args=(adb, serial, dest, items), daemon=True
+        )
+        self.worker.start()
+
+    def cancel_transfer(self):
+        self.cancel_flag.set()
+        if self.proc and self.proc.poll() is None:
+            try:
+                self.proc.terminate()
+            except Exception:
+                pass
+
+    def _transfer_worker(self, adb, serial, dest, items):
+        q = self.q
+        ok = failed = 0
+        try:
+            # Make sure destination exists on the phone.
+            r = subprocess.run(
+                [adb, "-s", serial, "shell", "mkdir", "-p", shlex.quote(dest)],
+                capture_output=True,
+                text=True,
+                creationflags=CREATE_NO_WINDOW,
+            )
+            if r.returncode != 0:
+                q.put(("log", f"[warn] mkdir: {(r.stdout + r.stderr).strip()}"))
+
+            total = len(items)
+            for i, path in enumerate(items, 1):
+                if self.cancel_flag.is_set():
+                    q.put(("log", "[cancelled]"))
+                    break
+                size = human_size(path_size(path))
+                q.put(("status", f"Sending {i}/{total}: {os.path.basename(path)} ({size})"))
+                q.put(("log", f"> {path}  ->  {dest}"))
+                self.proc = subprocess.Popen(
+                    [adb, "-s", serial, "push", path, dest],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    creationflags=CREATE_NO_WINDOW,
+                )
+                last = ""
+                for line in self.proc.stdout:
+                    line = line.strip()
+                    if line:
+                        last = line
+                        # Skip the noisy per-file progress lines; keep the summary.
+                        if not line.startswith("[") or "pushed" in line:
+                            q.put(("log", line))
+                self.proc.wait()
+                if self.cancel_flag.is_set():
+                    q.put(("log", "[cancelled]"))
+                    break
+                if self.proc.returncode == 0:
+                    ok += 1
+                else:
+                    failed += 1
+                    q.put(("log", f"[failed] {os.path.basename(path)}: {last}"))
+                q.put(("progress", i))
+
+            if self.cancel_flag.is_set():
+                q.put(("done", f"Cancelled ({ok} sent, {failed} failed)"))
+            elif failed:
+                q.put(("done", f"Finished with errors: {ok} sent, {failed} failed"))
+            else:
+                q.put(("done", f"Done - {ok} item(s) sent to {dest}"))
+        except Exception as e:
+            q.put(("log", f"[error] {e}"))
+            q.put(("done", f"Error: {e}"))
+
+    def _drain_queue(self):
+        try:
+            while True:
+                kind, val = self.q.get_nowait()
+                if kind == "log":
+                    self.log_write(val)
+                elif kind == "status":
+                    self.status_var.set(val)
+                elif kind == "progress":
+                    self.progress.config(value=val)
+                elif kind == "done":
+                    self.status_var.set(val)
+                    self.log_write(val)
+                    self.send_btn.config(state="normal")
+                    self.cancel_btn.config(state="disabled")
+        except queue.Empty:
+            pass
+        self.after(100, self._drain_queue)
+
+
+if __name__ == "__main__":
+    App().mainloop()
