@@ -121,6 +121,9 @@ class App(tk.Tk):
         ttk.Button(f_dev, text="Scan QR (Wi-Fi)", command=self.qr_connect).pack(
             side="left", padx=(0, 6)
         )
+        ttk.Button(f_dev, text="Pair with code", command=self.pair_with_code).pack(
+            side="left", padx=(0, 6)
+        )
 
         f_wifi = ttk.Frame(f_dev)
         f_wifi.pack(side="left", padx=(0, 6))
@@ -316,10 +319,13 @@ class App(tk.Tk):
             messagebox.showerror(APP_TITLE, str(e))
             return
 
-        name = "ADB_" + "".join(
-            secrets.choice(string.ascii_uppercase + string.digits) for _ in range(6)
+        # Same shape Android Studio uses for its pairing QR code.
+        name = "studio-" + "".join(
+            secrets.choice(string.ascii_lowercase + string.digits) for _ in range(10)
         )
-        password = "".join(secrets.choice(string.digits) for _ in range(8))
+        password = "".join(
+            secrets.choice(string.ascii_letters + string.digits) for _ in range(12)
+        )
         qr_text = f"WIFI:T:ADB;S:{name};P:{password};;"
 
         qr = qrcode.QRCode(error_correction=qrcode.constants.ERROR_CORRECT_M, border=0)
@@ -370,6 +376,11 @@ class App(tk.Tk):
             except tk.TclError:
                 pass
 
+        ttk.Button(
+            win,
+            text="Pair with code instead...",
+            command=lambda: (close(), self.pair_with_code()),
+        ).pack(pady=(0, 6))
         btn = ttk.Button(win, text="Cancel", command=close)
         btn.pack(pady=(0, 14))
         win.protocol("WM_DELETE_WINDOW", close)
@@ -426,13 +437,28 @@ class App(tk.Tk):
             return found
 
         try:
-            run(["start-server"], 30)
+            # An adb server that was started earlier (outside this app) may use a
+            # discovery backend that can't see phones. Restart it with ours.
+            chk = run(["mdns", "check"], 15)
+            chk_text = (chk.stdout + chk.stderr).strip()
+            if "openscreen" not in chk_text.lower():
+                qq.put(("status", "Restarting adb for Wi-Fi discovery..."))
+                run(["kill-server"], 15)
+                run(["start-server"], 30)
+                chk = run(["mdns", "check"], 15)
+                chk_text = (chk.stdout + chk.stderr).strip()
+            qq.put(("log", f"mDNS check: {chk_text or 'no output'}"))
+            qq.put(("status", "Waiting for the phone to scan..."))
 
             pair_addr = None
+            seen = set()
             deadline = time.time() + 180
             while time.time() < deadline and not cancel.is_set():
                 for sname, stype, addr in services():
-                    if "pairing" in stype and sname == name:
+                    if (sname, stype) not in seen:
+                        seen.add((sname, stype))
+                        qq.put(("log", f"mDNS: {sname} {stype} {addr}"))
+                    if "pairing" in stype and sname.lower() == name.lower():
                         pair_addr = addr
                         break
                 if pair_addr:
@@ -443,8 +469,10 @@ class App(tk.Tk):
             if not pair_addr:
                 qq.put((
                     "done", False,
-                    "Timed out waiting for the phone. Make sure Wireless debugging is on, "
-                    "both devices share the same Wi-Fi, then try again.",
+                    "Timed out: the PC never saw the phone's pairing service. Check that both "
+                    "devices are on the same Wi-Fi (not a guest network) and that Windows "
+                    "Firewall allows adb.exe on private networks. You can also use "
+                    "'Pair with code instead'.",
                 ))
                 return
 
@@ -478,6 +506,105 @@ class App(tk.Tk):
             ))
         except Exception as e:  # noqa: BLE001
             qq.put(("done", False, f"Error: {e}"))
+
+    def pair_with_code(self):
+        """Manual pairing: works even when mDNS discovery doesn't."""
+        try:
+            self.adb()
+        except FileNotFoundError as e:
+            messagebox.showerror(APP_TITLE, str(e))
+            return
+
+        win = tk.Toplevel(self)
+        win.title("Pair with code")
+        win.transient(self)
+        win.resizable(False, False)
+        ttk.Label(
+            win,
+            text=(
+                "On the phone: Developer options > Wireless debugging >\n"
+                "Pair device with pairing code. Enter what it shows:"
+            ),
+            justify="left",
+        ).grid(row=0, column=0, columnspan=2, padx=12, pady=(12, 6), sticky="w")
+
+        v_pair, v_code, v_conn = tk.StringVar(), tk.StringVar(), tk.StringVar()
+        rows = [
+            ("Pairing IP:port", v_pair),
+            ("Pairing code", v_code),
+            ("Connect IP:port (optional)", v_conn),
+        ]
+        for i, (label, var) in enumerate(rows, start=1):
+            ttk.Label(win, text=label).grid(row=i, column=0, padx=(12, 6), pady=4, sticky="e")
+            ttk.Entry(win, textvariable=var, width=28).grid(
+                row=i, column=1, padx=(0, 12), pady=4
+            )
+        ttk.Label(
+            win,
+            text=(
+                "The connect IP:port is on the main Wireless debugging screen\n"
+                "(its port differs from the pairing port)."
+            ),
+            justify="left",
+        ).grid(row=4, column=0, columnspan=2, padx=12, pady=(2, 6), sticky="w")
+
+        def go():
+            pair, code, conn = v_pair.get().strip(), v_code.get().strip(), v_conn.get().strip()
+            if not pair or not code:
+                messagebox.showinfo(APP_TITLE, "Enter the pairing IP:port and the pairing code.")
+                return
+            win.config(cursor="watch")
+            win.update_idletasks()
+            try:
+                r = self.run_adb(["pair", pair, code], timeout=30)
+                text = (r.stdout + r.stderr).strip()
+                self.log_write(text)
+                if "successfully paired" not in text.lower():
+                    messagebox.showerror(APP_TITLE, f"Pairing failed:\n{text or 'no response from adb'}")
+                    return
+                if not conn:
+                    host = pair.rsplit(":", 1)[0]
+                    for _ in range(4):
+                        out = self.run_adb(["mdns", "services"], timeout=10).stdout
+                        for line in out.splitlines():
+                            parts = line.split()
+                            if (
+                                len(parts) >= 3
+                                and "connect" in parts[1]
+                                and parts[-1].startswith(host + ":")
+                            ):
+                                conn = parts[-1]
+                        if conn:
+                            break
+                        time.sleep(1.0)
+                if conn:
+                    r = self.run_adb(["connect", conn], timeout=15)
+                    out = (r.stdout + r.stderr).strip()
+                    self.log_write(out)
+                    if "connected" in out.lower():
+                        self.refresh_devices()
+                        win.destroy()
+                        return
+                    messagebox.showwarning(APP_TITLE, f"Paired, but connect failed:\n{out}")
+                else:
+                    messagebox.showinfo(
+                        APP_TITLE,
+                        "Paired. Now enter the Connect IP:port from the Wireless debugging "
+                        "screen and press the button again (or use 'Connect (Wi-Fi)').",
+                    )
+            except Exception as e:  # noqa: BLE001
+                messagebox.showerror(APP_TITLE, str(e))
+            finally:
+                try:
+                    win.config(cursor="")
+                except tk.TclError:
+                    pass
+                self.refresh_devices()
+
+        bar = ttk.Frame(win)
+        bar.grid(row=5, column=0, columnspan=2, pady=(0, 12))
+        ttk.Button(bar, text="Pair and connect", command=go).pack(side="left", padx=4)
+        ttk.Button(bar, text="Close", command=win.destroy).pack(side="left", padx=4)
 
     # ----------------------------------------------------------- file list
     def _add_paths(self, paths):
