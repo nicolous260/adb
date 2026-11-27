@@ -20,7 +20,7 @@ jobs:
           python-version: '3.12'
 
       - name: Install PyInstaller
-        run: python -m pip install --upgrade pyinstaller qrcode
+        run: python -m pip install --upgrade pyinstaller qrcode windnd
 
       - name: Build exe
         run: python -m PyInstaller --onefile --noconsole --name ADBFileTransfer adb_transfer.py

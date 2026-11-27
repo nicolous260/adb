@@ -1,1 +1,2 @@
 qrcode
+windnd; sys_platform == "win32"
