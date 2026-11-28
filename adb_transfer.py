@@ -27,8 +27,10 @@ import shutil
 import string
 import subprocess
 import sys
+import tempfile
 import threading
 import time
+import zipfile
 import tkinter as tk
 from tkinter import filedialog, font as tkfont, ttk
 
@@ -168,6 +170,46 @@ def style_titlebar(win):
         setattr_(36, _colorref(TEXT))  # caption text colour
     except Exception:
         pass
+
+
+ZIP_APPS = (".apks", ".xapk", ".apkm")  # bundles of split APKs
+APK_EXTS = (".apk",) + ZIP_APPS
+INSTALL_OPTIONS = [
+    ("replace", "Replace if already installed", "Keeps the app's data", True),
+    ("grant", "Grant all permissions", "Skips the permission prompts", False),
+    ("downgrade", "Allow older versions", "Install over a newer version", False),
+    ("test", "Allow test builds", "For debug and test-only APKs", False),
+    ("combine", "Combine into one app", "For split APKs added together", False),
+]
+INSTALL_ERRORS = {
+    "INSTALL_FAILED_ALREADY_EXISTS": "Already installed. Turn on Replace if already installed",
+    "INSTALL_FAILED_UPDATE_INCOMPATIBLE": "Signed differently from the installed app. Uninstall that app first",
+    "INSTALL_FAILED_VERSION_DOWNGRADE": "A newer version is installed. Turn on Allow older versions",
+    "INSTALL_FAILED_INSUFFICIENT_STORAGE": "Not enough storage on the phone",
+    "INSTALL_FAILED_OLDER_SDK": "This app needs a newer version of Android",
+    "INSTALL_FAILED_TEST_ONLY": "Test build. Turn on Allow test builds",
+    "INSTALL_FAILED_USER_RESTRICTED": "Blocked by the phone. Allow installs over USB in Developer options",
+    "INSTALL_FAILED_NO_MATCHING_ABIS": "This app doesn't support the phone's processor",
+    "INSTALL_FAILED_MISSING_SPLIT": "Split APKs are missing. Add them all and turn on Combine into one app",
+    "INSTALL_FAILED_VERIFICATION_FAILURE": "Blocked by Play Protect or app verification",
+    "INSTALL_PARSE_FAILED_NO_CERTIFICATES": "The APK isn't signed",
+    "INSTALL_PARSE_FAILED_NOT_APK": "Not a valid APK file",
+    "INSTALL_FAILED_INVALID_APK": "Not a valid APK file",
+}
+
+
+def explain_install_error(text):
+    m = re.search(r"(INSTALL_[A-Z_]+)", text)
+    if m:
+        return INSTALL_ERRORS.get(m.group(1), m.group(1).replace("_", " ").capitalize())
+    last = [ln for ln in text.splitlines() if ln.strip()]
+    return last[-1][:120] if last else "Install failed"
+
+
+def mix(c1, c2, t):
+    a = [int(c1[i:i + 2], 16) for i in (1, 3, 5)]
+    b = [int(c2[i:i + 2], 16) for i in (1, 3, 5)]
+    return "#%02x%02x%02x" % tuple(int(x + (y - x) * t) for x, y in zip(a, b))
 
 
 # ------------------------------------------------------------------ app icon
@@ -377,7 +419,7 @@ for _kind, _exts in {
     "audio": "mp3 flac wav m4a aac ogg opus wma",
     "archive": "zip rar 7z tar gz xz iso",
     "doc": "pdf doc docx txt md xls xlsx ppt pptx csv epub",
-    "apk": "apk xapk apks aab obb",
+    "apk": "apk xapk apks apkm aab obb",
 }.items():
     for _e in _exts.split():
         EXT_KIND[_e] = _kind
@@ -624,6 +666,7 @@ class ProgressBar(tk.Canvas):
         bg = SURFACE if bg is None else bg
         super().__init__(master, height=px(4), bg=bg, highlightthickness=0, bd=0)
         self.frac, self.color = 0.0, ACCENT
+        self.phase = None  # set to a 0..1 value for an indeterminate sweep (installs)
         self.bind("<Configure>", lambda e: self.draw())
 
     def set(self, frac, color=None):
@@ -640,6 +683,15 @@ class ProgressBar(tk.Canvas):
         rrect(self, 0, 0, w, h, h / 2, fill=RAISED, outline="")
         if self.frac > 0:
             rrect(self, 0, 0, max(w * self.frac, h), h, h / 2, fill=self.color, outline="")
+        if self.phase is not None:
+            fw = w * self.frac
+            span = w - fw
+            if span > h * 2:
+                seg = span * 0.3
+                start = fw + self.phase * (span + seg) - seg
+                x0, x1 = max(start, fw), min(start + seg, w)
+                if x1 - x0 > 2:
+                    rrect(self, x0, 0, x1, h, h / 2, fill=mix(RAISED, ACCENT, 0.6), outline="")
 
 
 class Route(tk.Canvas):
@@ -743,11 +795,15 @@ class Route(tk.Canvas):
 
 
 class DropZone(tk.Canvas):
-    def __init__(self, master, on_files, on_folder, can_drop):
+    def __init__(self, master, on_files, on_folder, can_drop, labels=None):
         super().__init__(master, bg=BG, highlightthickness=0, bd=0)
         self.can_drop = can_drop
-        self.b1 = RButton(self, "Add files", on_files, "primary", height=40, pad=20, weight="bold")
-        self.b2 = RButton(self, "Add folder", on_folder, "ghost", height=40, pad=20)
+        self.labels = dict(drop="Drop files or folders here", add="Add files or folders",
+                           sub="They go to the phone folder chosen on the right",
+                           b1="Add files", b2="Add folder")
+        self.labels.update(labels or {})
+        self.b1 = RButton(self, self.labels["b1"], on_files, "primary", height=40, pad=20, weight="bold")
+        self.b2 = RButton(self, self.labels["b2"], on_folder, "ghost", height=40, pad=20)
         self.bind("<Configure>", lambda e: self.draw())
 
     def draw(self):
@@ -758,10 +814,10 @@ class DropZone(tk.Canvas):
         rrect(self, 1, 1, w - 1, h - 1, px(16), fill=SURFACE, outline=LINE, width=1)
         x0 = px(44)
         top = max(px(26), h / 2 - px(60))
-        title = "Drop files or folders here" if self.can_drop else "Add files or folders"
+        title = self.labels["drop"] if self.can_drop else self.labels["add"]
         self.create_text(x0, top, text=title, anchor="w", font=font(18, "bold"), fill=TEXT)
         self.create_text(x0, top + px(34), anchor="w", font=font(10), fill=MUTED,
-                         text="They go to the phone folder chosen on the right")
+                         text=self.labels["sub"])
         by = top + px(90)
         gap = px(10)
         self.create_window(x0, by, window=self.b1, anchor="w")
@@ -790,6 +846,7 @@ class Row(tk.Canvas):
         self.state = "queued"
         self.removable = True
         self.selected = False
+        self.note = ""
         self.hover = False
         self.phase = 0
         self.bind("<Configure>", lambda e: self.redraw())
@@ -878,8 +935,12 @@ class Row(tk.Canvas):
             sub = self.parent
         else:
             sub = self.parent or ("Folder" if self.is_dir else "")
-        self.create_text(tx, h / 2 + px(11), text=ellipsize(sub, font(9), maxw, keep="end"),
-                         anchor="w", font=font(9), fill=MUTED)
+        if self.note and self.state == "failed":
+            self.create_text(tx, h / 2 + px(11), text=ellipsize(self.note, font(9), maxw),
+                             anchor="w", font=font(9), fill=BAD)
+        else:
+            self.create_text(tx, h / 2 + px(11), text=ellipsize(sub, font(9), maxw, keep="end"),
+                             anchor="w", font=font(9), fill=MUTED)
         self.create_text(size_right, h / 2, text=self.size_text, anchor="e", font=font(9, mono=True), fill=MUTED)
         # tail
         cx, cy, r = w - px(26), h / 2, px(9)
@@ -1024,6 +1085,12 @@ class FileList(tk.Frame):
             row.size_text = text
             row.redraw()
 
+    def set_note(self, path, text):
+        row = self.rows.get(path)
+        if row:
+            row.note = text
+            row.redraw()
+
     def set_state(self, path, state):
         row = self.rows.get(path)
         if not row:
@@ -1045,6 +1112,7 @@ class FileList(tk.Frame):
 
     def reset_states(self):
         for row in self.rows.values():
+            row.note = ""
             row.set_state("queued")
 
     def pulse(self):
@@ -1052,6 +1120,56 @@ class FileList(tk.Frame):
             if row.state == "sending":
                 row.phase = (row.phase + 1) % 20
                 row.redraw()
+
+
+class CheckRow(tk.Canvas):
+    """Checkbox with a label and a one-line hint."""
+
+    def __init__(self, master, text, hint, variable, command=None):
+        super().__init__(master, height=px(44), bg=BG, highlightthickness=0, bd=0,
+                         cursor="hand2", takefocus=1)
+        self.text, self.hint, self.var, self.command = text, hint, variable, command
+        self._hover = self._focus = False
+        self.bind("<Configure>", lambda e: self.draw())
+        self.bind("<Enter>", lambda e: self._set(_hover=True))
+        self.bind("<Leave>", lambda e: self._set(_hover=False))
+        self.bind("<ButtonRelease-1>", lambda e: self.toggle())
+        self.bind("<FocusIn>", lambda e: self._set(_focus=True))
+        self.bind("<FocusOut>", lambda e: self._set(_focus=False))
+        self.bind("<space>", lambda e: self.toggle())
+        self.bind("<Return>", lambda e: self.toggle())
+
+    def _set(self, **kw):
+        for k, v in kw.items():
+            setattr(self, k, v)
+        self.draw()
+
+    def toggle(self):
+        self.var.set(not self.var.get())
+        if self.command:
+            self.command()
+        self.draw()
+
+    def draw(self):
+        self.delete("all")
+        w, h = self.winfo_width(), self.winfo_height()
+        if w < 40:
+            return
+        if self._focus:
+            rrect(self, 0, 2, w, h - 2, px(10), fill="", outline=ACCENT_HI, width=2)
+        bs, bx, by = px(20), px(8), (h - px(20)) // 2
+        if self.var.get():
+            rrect(self, bx, by, bx + bs, by + bs, px(6), fill=PRIMARY, outline="")
+            self.create_line(bx + px(5), by + px(10), bx + px(8.5), by + px(13.5), bx + px(15), by + px(6.5),
+                             fill=PRIMARY_FG, width=2, capstyle="round", joinstyle="round")
+        else:
+            rrect(self, bx + 1, by + 1, bx + bs - 1, by + bs - 1, px(6), fill="",
+                  outline=TEXT if self._hover else LINE_HI, width=2)
+        tx = bx + bs + px(12)
+        self.create_text(tx, h / 2 - px(7), text=ellipsize(self.text, font(10), w - tx), anchor="w",
+                         font=font(10), fill=TEXT)
+        self.create_text(tx, h / 2 + px(9), text=ellipsize(self.hint, font(9), w - tx), anchor="w",
+                         font=font(9), fill=MUTED)
 
 
 class ThemeButton(tk.Canvas):
@@ -1148,9 +1266,9 @@ class App(tk.Tk):
         self.configure(bg=BG)
         self._set_icon()
         sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
-        w, h = min(px(1020), sw - 60), min(px(740), sh - 90)
+        w, h = min(px(1060), sw - 60), min(px(780), sh - 90)
         self.geometry(f"{w}x{h}+{(sw - w) // 2}+{max(0, (sh - h) // 3)}")
-        self.minsize(min(px(920), w), min(px(640), h))
+        self.minsize(min(px(960), w), min(px(640), h))
 
         self.adb_path = tk.StringVar(value=find_adb())
         self.device_var = tk.StringVar()
@@ -1164,6 +1282,11 @@ class App(tk.Tk):
         self._browse_gen = 0
 
         self.items = []  # absolute paths to transfer
+        self.apks = []  # APK files queued for install
+        saved = self._prefs.get("install_opts", {})
+        self.opt_vars = {k: tk.BooleanVar(value=saved.get(k, default)) for k, _l, _h, default in INSTALL_OPTIONS}
+        for var in self.opt_vars.values():
+            var.trace_add("write", lambda *_: self._save_opts())
         self.sizes = {}  # path -> bytes (once known)
         self.devices = {}  # display label -> serial
         self.models = {}  # serial -> nice model name
@@ -1208,6 +1331,10 @@ class App(tk.Tk):
         except tk.TclError:
             pass
 
+    def _save_opts(self):
+        self._prefs["install_opts"] = {k: v.get() for k, v in self.opt_vars.items()}
+        save_prefs(self._prefs)
+
     def toggle_theme(self):
         if self.sending:
             self.set_status("Wait for the transfer to finish before changing the theme", "dim")
@@ -1219,6 +1346,7 @@ class App(tk.Tk):
         snap = dict(
             mode=self.mode,
             rows={p: r.state for p, r in self.filelist.rows.items()},
+            apk_rows={p: (r.state, r.note) for p, r in self.apklist.rows.items()},
             status=self._status,
             progress=(self.progress.frac, self.progress.color),
             stats=self.stats_lbl.cget("text"),
@@ -1246,7 +1374,12 @@ class App(tk.Tk):
             if p in self.sizes:
                 row.size_text = human_size(self.sizes[p])
             row.state = snap["rows"].get(p, "queued")
+        for p in self.apks:
+            row = self.apklist.add(p)
+            row.size_text = human_size(self.sizes.get(p, 0))
+            row.state, row.note = snap["apk_rows"].get(p, ("queued", ""))
         self._show_stage()
+        self._show_apk_stage()
         for text, tag in self._log_history:
             self._log_insert(text, tag)
         if snap["log_open"]:
@@ -1254,9 +1387,9 @@ class App(tk.Tk):
             self.log_frame.grid(row=3, column=0, sticky="ew")
             self.act_btn.set_text("Hide activity")
         self._apply_device()
-        if snap["mode"] == "pull":
+        if snap["mode"] != "push":
             self.mode = "push"
-            self.set_direction("pull")
+            self.set_direction(snap["mode"])
         self.progress.set(*snap["progress"])
         self.stats_lbl.configure(text=snap["stats"])
         self.send_btn.set_text(snap["send"])
@@ -1320,15 +1453,19 @@ class App(tk.Tk):
 
         bar = tk.Frame(f, bg=BG)
         bar.grid(row=0, column=0, sticky="ew", pady=(0, px(12)))
-        self.seg = Segmented(bar, [("push", "To phone"), ("pull", "From phone")], self.set_direction)
+        self.seg = Segmented(bar, [("push", "To phone"), ("pull", "From phone"), ("install", "Install apps")],
+                             self.set_direction)
         self.seg.pack(side="left")
-        self.count_lbl = tk.Label(bar, text="", font=font(9, mono=True), bg=BG, fg=MUTED)
-        self.count_lbl.pack(side="left", padx=(px(12), 0), pady=(px(4), 0))
         self.tools = tk.Frame(bar, bg=BG)
         RButton(self.tools, "Clear", self.clear_items, "quiet", height=32, pad=12).pack(side="right")
         RButton(self.tools, "Add folder", self.add_folder, "ghost", height=32, pad=14).pack(
             side="right", padx=px(8))
         RButton(self.tools, "Add files", self.add_files, "ghost", height=32, pad=14).pack(side="right")
+        self.apk_tools = tk.Frame(bar, bg=BG)
+        RButton(self.apk_tools, "Clear", self.clear_apks, "quiet", height=32, pad=12).pack(side="right")
+        RButton(self.apk_tools, "Add folder", self.add_apk_folder, "ghost", height=32, pad=14).pack(
+            side="right", padx=px(8))
+        RButton(self.apk_tools, "Add APKs", self.add_apks, "ghost", height=32, pad=14).pack(side="right")
 
         stage = self.push_stage = tk.Frame(f, bg=BG)
         stage.grid(row=1, column=0, sticky="nsew")
@@ -1337,6 +1474,17 @@ class App(tk.Tk):
         self.dropzone = DropZone(stage, self.add_files, self.add_folder, self.can_drop)
         self.filelist = FileList(stage, self.remove_path)
         self.dropzone.grid(row=0, column=0, sticky="nsew")
+
+        # install apps
+        astage = self.apk_stage = tk.Frame(f, bg=BG)
+        astage.columnconfigure(0, weight=1)
+        astage.rowconfigure(0, weight=1)
+        self.apk_drop = DropZone(astage, self.add_apks, self.add_apk_folder, self.can_drop, labels=dict(
+            drop="Drop APK files here", add="Add APK files",
+            sub="Also works with .apks, .xapk and .apkm bundles",
+            b1="Add APKs", b2="Add folder"))
+        self.apklist = FileList(astage, self.remove_apk)
+        self.apk_drop.grid(row=0, column=0, sticky="nsew")
 
         # phone browser (From phone)
         ps = self.pull_stage = tk.Frame(f, bg=BG)
@@ -1403,6 +1551,10 @@ class App(tk.Tk):
         Field(prow, textvariable=self.save_var, mono=True).grid(row=0, column=0, sticky="ew")
         RButton(prow, "Browse", self.browse_save, "ghost", height=40, pad=16).grid(
             row=0, column=1, padx=(px(8), 0))
+
+        self.apk_opts = tk.Frame(holder, bg=BG)
+        for key, label, hint, _d in INSTALL_OPTIONS:
+            CheckRow(self.apk_opts, label, hint, self.opt_vars[key]).pack(fill="x")
 
         # connection
         head = tk.Frame(inner, bg=BG)
@@ -1984,6 +2136,9 @@ class App(tk.Tk):
         self.after(0, lambda: self._add_paths(paths))
 
     def _add_paths(self, paths):
+        if self.mode == "install":
+            self._add_apks(paths)
+            return
         if self.mode != "push":
             self.set_status("Switch to To phone to send files", "dim")
             return
@@ -2005,7 +2160,6 @@ class App(tk.Tk):
                             "Ready to send" if self.selected_serial() else "Not connected")
         self.progress.set(0, ACCENT)
         self.stats_lbl.configure(text="")
-        self.set_status(f"{len(self.items)} item{'s' if len(self.items) != 1 else ''} ready to send", "normal")
         threading.Thread(target=self._measure, args=(fresh,), daemon=True).start()
         self._update_count()
 
@@ -2014,25 +2168,32 @@ class App(tk.Tk):
             self.q.put(("size", p, path_size(p)))
 
     def _update_count(self):
+        """Selection summary lives in the status line."""
+        if self.sending:
+            return
         if self.mode == "pull":
             n = len(self.sel)
             if not n:
-                self.count_lbl.configure(text="")
+                self.set_status("Click files or folders on the phone to select them", "dim")
                 return
             known = [self.rsizes[p] for p in self.sel if p in self.rsizes]
             text = f"{n} selected"
             if len(known) == n:
                 text += f" · {human_size(sum(known))}"
-            self.count_lbl.configure(text=text)
+            self.set_status(text, "normal")
             return
-        if not self.items:
-            self.count_lbl.configure(text="")
+        if self.mode == "install":
+            lst, noun, tail, empty = self.apks, "APK", "ready to install", "Add APK files to get started"
+        else:
+            lst, noun, tail, empty = self.items, "item", "ready to send", "Add files to get started"
+        if not lst:
+            self.set_status(empty, "dim")
             return
-        known = [self.sizes[p] for p in self.items if p in self.sizes]
-        text = f"{len(self.items)} item{'s' if len(self.items) != 1 else ''}"
-        if len(known) == len(self.items):
+        known = [self.sizes[p] for p in lst if p in self.sizes]
+        text = f"{len(lst)} {noun}{'s' if len(lst) != 1 else ''}"
+        if len(known) == len(lst):
             text += f" · {human_size(sum(known))}"
-        self.count_lbl.configure(text=text)
+        self.set_status(f"{text} {tail}", "normal")
 
     def _show_stage(self):
         if self.items:
@@ -2063,10 +2224,6 @@ class App(tk.Tk):
         self.filelist.remove(path)
         self._show_stage()
         self._update_count()
-        if not self.items:
-            self.set_status("Add files to get started", "dim")
-        else:
-            self.set_status(f"{len(self.items)} item{'s' if len(self.items) != 1 else ''} ready to send", "normal")
 
     def clear_items(self):
         if self.sending:
@@ -2080,12 +2237,14 @@ class App(tk.Tk):
         self.stats_lbl.configure(text="")
         self.route.set_mode("ready" if self.selected_serial() else "idle",
                             "Ready to send" if self.selected_serial() else "Not connected")
-        self.set_status("Add files to get started", "dim")
 
     # ------------------------------------------------------------ transfer
     def start_transfer(self):
         if self.mode == "pull":
             self._start_pull()
+            return
+        if self.mode == "install":
+            self._start_install()
             return
         if self.worker and self.worker.is_alive():
             return
@@ -2238,28 +2397,259 @@ class App(tk.Tk):
         self._active_list().pulse()
         target = self._bytes / self._total if self._total else 0
         self._disp += (target - self._disp) * 0.2
+        if self.mode == "install":
+            self.progress.phase = ((self.progress.phase or 0.0) + 0.012) % 1.0
         self.progress.set(self._disp, ACCENT)
         if now - self._last_t >= 0.7:
             inst = (self._bytes - self._last_bytes) / (now - self._last_t)
             self._speed = inst if self._speed == 0 else self._speed * 0.6 + inst * 0.4
             self._last_t, self._last_bytes = now, self._bytes
             i, n = self._index
-            speed = f" · {human_size(self._speed)}/s" if self._speed > 0 else ""
+            speed = f" · {human_size(self._speed)}/s" if self._speed > 0 and self.mode != "install" else ""
             self.route.set_center(f"{i} of {n}{speed}")
             self.stats_lbl.configure(text=f"{human_size(self._bytes)} of {human_size(self._total)}")
         self.after(33, self._tick)
 
+    # ------------------------------------------------------ Install apps
+    def _show_apk_stage(self):
+        if self.apks:
+            self.apk_drop.grid_remove()
+            self.apklist.grid(row=0, column=0, sticky="nsew")
+            if self.mode == "install":
+                self.apk_tools.pack(side="right")
+        else:
+            self.apklist.grid_remove()
+            self.apk_tools.pack_forget()
+            self.apk_drop.grid(row=0, column=0, sticky="nsew")
+
+    def add_apks(self):
+        paths = filedialog.askopenfilenames(
+            title="Choose apps to install",
+            filetypes=[("Android apps", "*.apk *.apks *.xapk *.apkm"), ("All files", "*.*")])
+        if paths:
+            self._add_apks(paths)
+
+    def add_apk_folder(self):
+        p = filedialog.askdirectory(title="Choose a folder with APK files")
+        if p:
+            self._add_apks([p])
+
+    def _add_apks(self, paths):
+        if self.sending:
+            self.set_status("Wait for the current install to finish before adding more", "dim")
+            return
+        found, skipped = [], 0
+        for p in paths:
+            p = os.path.abspath(p)
+            if os.path.isdir(p):
+                for root, _dirs, files in os.walk(p):
+                    found += [os.path.join(root, f) for f in sorted(files) if f.lower().endswith(APK_EXTS)]
+            elif p.lower().endswith(APK_EXTS):
+                found.append(p)
+            else:
+                skipped += 1
+        fresh = []
+        for p in found:
+            if p not in self.apks:
+                self.apks.append(p)
+                self.apklist.add(p)
+                try:
+                    self.sizes[p] = os.path.getsize(p)
+                except OSError:
+                    self.sizes[p] = 0
+                self.apklist.set_size(p, human_size(self.sizes[p]))
+                fresh.append(p)
+        if not fresh:
+            if skipped:
+                self.set_status("Only .apk, .apks, .xapk and .apkm files can be installed", "dim")
+            return
+        self._show_apk_stage()
+        self.apklist.reset_states()
+        self._reset_route()
+        self.progress.set(0, ACCENT)
+        self.stats_lbl.configure(text="")
+        self._update_count()
+
+    def remove_apk(self, path):
+        if self.sending or path not in self.apks:
+            return
+        self.apks.remove(path)
+        self.apklist.remove(path)
+        self._show_apk_stage()
+        self._update_count()
+
+    def clear_apks(self):
+        if self.sending:
+            return
+        self.apks.clear()
+        self.apklist.clear()
+        self._show_apk_stage()
+        self.progress.set(0, ACCENT)
+        self.stats_lbl.configure(text="")
+        self._reset_route()
+        self._update_count()
+
+    def _start_install(self):
+        if self.worker and self.worker.is_alive():
+            return
+        if not self.apks:
+            self.alert("Nothing to install", "Add at least one APK file first.", "info")
+            return
+        serial = self.selected_serial()
+        if not serial:
+            self.refresh_devices()
+            serial = self.selected_serial()
+            if not serial:
+                self.alert("No phone selected",
+                           "Connect a phone with USB debugging on, or pair one over Wi-Fi, then try again.",
+                           "error")
+                return
+        try:
+            adb = self.adb()
+        except FileNotFoundError as e:
+            self.alert("adb not found", str(e), "error")
+            return
+        items = list(self.apks)
+        opts = {k: v.get() for k, v in self.opt_vars.items()}
+        self.cancel_flag.clear()
+        self.sending = True
+        self.apklist.reset_states()
+        self.apklist.set_removable(False)
+        self.send_btn.set_text("Installing…")
+        self.send_btn.set_enabled(False)
+        self.cancel_btn.pack(side="right", padx=(0, px(8)))
+        self._bytes = self._last_bytes = 0
+        self._total = sum(self.sizes.get(p, 0) for p in items)
+        self._disp, self._speed = 0.0, 0.0
+        self._t0 = self._last_t = time.time()
+        self._index = (0, len(items))
+        self.progress.set(0, ACCENT)
+        self.progress.phase = 0.0
+        self.stats_lbl.configure(text="")
+        self.route.set_mode("sending", f"0 of {len(items)}")
+        self.worker = threading.Thread(target=self._install_worker, args=(adb, serial, items, opts), daemon=True)
+        self.worker.start()
+        self.after(33, self._tick)
+
+    @staticmethod
+    def _unpack_bundle(path, tmp):
+        """Extract an .apks/.xapk/.apkm; returns (apk files, [(local obb, phone path)])."""
+        with zipfile.ZipFile(path) as z:
+            names = z.namelist()
+            z.extractall(tmp)
+            apks = sorted(os.path.join(tmp, n) for n in names if n.lower().endswith(".apk"))
+            obbs = []
+            if "manifest.json" in names:
+                try:
+                    with z.open("manifest.json") as mf:
+                        manifest = json.load(mf)
+                    for e in manifest.get("expansions", []):
+                        if e.get("file") and e.get("install_path"):
+                            obbs.append((os.path.join(tmp, e["file"]), "/sdcard/" + e["install_path"].lstrip("/")))
+                except Exception:
+                    pass
+        return apks, obbs
+
+    def _install_worker(self, adb, serial, items, opts):
+        q = self.q
+        ok = failed = 0
+        flags = [f for key, f in (("replace", "-r"), ("grant", "-g"), ("downgrade", "-d"), ("test", "-t"))
+                 if opts.get(key)]
+        plain = [p for p in items if not p.lower().endswith(ZIP_APPS)]
+        combine = bool(opts.get("combine")) and len(plain) > 1
+        jobs, placed = [], False
+        for p in items:
+            if p.lower().endswith(ZIP_APPS):
+                jobs.append(("bundle", [p]))
+            elif combine:
+                if not placed:
+                    jobs.append(("multi", plain))
+                    placed = True
+            else:
+                jobs.append(("single", [p]))
+        try:
+            q.put(("total", sum(self.sizes.get(p, 0) for p in items)))
+            base = 0
+            for i, (kind, paths) in enumerate(jobs, 1):
+                if self.cancel_flag.is_set():
+                    q.put(("log", "[cancelled]"))
+                    break
+                name = os.path.basename(paths[0]) if kind != "multi" else f"{len(paths)} APKs"
+                for p in paths:
+                    q.put(("file", p, "sending"))
+                q.put(("index", i, len(jobs)))
+                q.put(("status", f"Installing {name}"))
+                q.put(("log", f"> install {name}"))
+                tmp, obbs, success, out = None, [], False, ""
+                try:
+                    if kind == "single":
+                        cmd = [adb, "-s", serial, "install"] + flags + [paths[0]]
+                    elif kind == "multi":
+                        cmd = [adb, "-s", serial, "install-multiple"] + flags + paths
+                    else:
+                        tmp = tempfile.mkdtemp(prefix="adbx_")
+                        apks, obbs = self._unpack_bundle(paths[0], tmp)
+                        if not apks:
+                            raise RuntimeError("No APK files found inside this bundle")
+                        cmd = [adb, "-s", serial, "install-multiple"] + flags + apks
+                    self.proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                                 text=True, env=ADB_ENV, creationflags=CREATE_NO_WINDOW)
+                    lines = [ln.strip() for ln in self.proc.stdout if ln.strip()]
+                    self.proc.wait()
+                    out = "\n".join(lines)
+                    for ln in lines:
+                        q.put(("log", ln))
+                    success = self.proc.returncode == 0 and "success" in out.lower()
+                    if success and obbs and not self.cancel_flag.is_set():
+                        for local, remote in obbs:
+                            q.put(("status", f"Copying game data for {name}"))
+                            subprocess.run([adb, "-s", serial, "shell", "mkdir", "-p",
+                                            shlex.quote(posixpath.dirname(remote))],
+                                           capture_output=True, env=ADB_ENV, creationflags=CREATE_NO_WINDOW)
+                            r = subprocess.run([adb, "-s", serial, "push", local, remote], capture_output=True,
+                                               text=True, env=ADB_ENV, creationflags=CREATE_NO_WINDOW)
+                            q.put(("log", (r.stdout + r.stderr).strip().splitlines()[-1] if (r.stdout + r.stderr).strip() else ""))
+                            if r.returncode != 0:
+                                q.put(("log", f"[warn] could not copy {os.path.basename(local)}"))
+                except Exception as e:  # noqa: BLE001
+                    out = str(e)
+                finally:
+                    if tmp:
+                        shutil.rmtree(tmp, ignore_errors=True)
+                if self.cancel_flag.is_set():
+                    for p in paths:
+                        q.put(("file", p, "queued"))
+                    q.put(("log", "[cancelled]"))
+                    break
+                base += sum(self.sizes.get(p, 0) for p in paths)
+                if success:
+                    ok += 1
+                    for p in paths:
+                        q.put(("file", p, "done"))
+                else:
+                    failed += 1
+                    reason = explain_install_error(out)
+                    for p in paths:
+                        q.put(("note", p, reason))
+                        q.put(("file", p, "failed"))
+                    q.put(("log", f"[failed] {name}: {reason}"))
+                q.put(("bytes", base))
+            q.put(("done", ok, failed, self.cancel_flag.is_set(), ""))
+        except Exception as e:  # noqa: BLE001
+            q.put(("log", f"[error] {e}"))
+            q.put(("done", ok, failed + 1, False, ""))
+
     # --------------------------------------------------- From phone (pull)
     def _active_list(self):
-        return self.phonelist if self.mode == "pull" else self.filelist
+        return {"pull": self.phonelist, "install": self.apklist}.get(self.mode, self.filelist)
 
     def _action_text(self):
-        return "Save to PC" if self.mode == "pull" else "Send to phone"
+        return {"pull": "Save to PC", "install": "Install on phone"}.get(self.mode, "Send to phone")
 
     def _reset_route(self):
         has = bool(self.selected_serial())
         self.route.set_mode("ready" if has else "idle",
-                            ("Ready to save" if self.mode == "pull" else "Ready to send") if has else "Not connected")
+                            {"pull": "Ready to save", "install": "Ready to install"}.get(self.mode, "Ready to send") if has else "Not connected")
 
     def set_direction(self, mode):
         if self.sending or mode == self.mode:
@@ -2272,25 +2662,24 @@ class App(tk.Tk):
         self._reset_route()
         self.route.reverse = mode == "pull"
         self.send_btn.set_text(self._action_text())
+        stages = {"push": self.push_stage, "pull": self.pull_stage, "install": self.apk_stage}
+        dests = {"push": self.push_dest, "pull": self.pull_dest, "install": self.apk_opts}
+        titles = {"push": "Send to", "pull": "Save to", "install": "Install options"}
+        for key in stages:
+            if key != mode:
+                stages[key].grid_remove()
+                dests[key].pack_forget()
+        self.tools.pack_forget()
+        self.apk_tools.pack_forget()
+        stages[mode].grid(row=1, column=0, sticky="nsew")
+        dests[mode].pack(fill="x")
+        self.side_title.configure(text=titles[mode])
         if mode == "pull":
-            self.push_stage.grid_remove()
-            self.tools.pack_forget()
-            self.pull_stage.grid(row=1, column=0, sticky="nsew")
-            self.push_dest.pack_forget()
-            self.pull_dest.pack(fill="x")
-            self.side_title.configure(text="Save to")
-            self.set_status("Click files or folders on the phone to select them", "dim")
             self.browse(self.remote_path)
-        else:
-            self.pull_stage.grid_remove()
-            self.push_stage.grid(row=1, column=0, sticky="nsew")
-            self.pull_dest.pack_forget()
-            self.push_dest.pack(fill="x")
-            self.side_title.configure(text="Send to")
+        elif mode == "push":
             self._show_stage()
-            self.set_status("Add files to get started" if not self.items else
-                            f"{len(self.items)} item{'s' if len(self.items) != 1 else ''} ready to send",
-                            "dim" if not self.items else "normal")
+        else:
+            self._show_apk_stage()
         self._update_count()
 
     def browse_save(self):
@@ -2491,14 +2880,15 @@ class App(tk.Tk):
             q.put(("done", ok, failed + 1, False, dest))
 
     def _finish(self, ok, failed, cancelled, dest):
-        word = "Saved" if self.mode == "pull" else "Sent"
+        word = {"pull": "Saved", "install": "Installed"}.get(self.mode, "Sent")
+        self.progress.phase = None
         self.sending = False
         elapsed = max(time.time() - self._t0, 0.1)
         self._active_list().set_removable(True)
         self.send_btn.set_text(self._action_text())
         self.send_btn.set_enabled(True)
         self.cancel_btn.pack_forget()
-        avg = f" · {human_size(self._total / elapsed)}/s" if self._total and ok else ""
+        avg = f" · {human_size(self._total / elapsed)}/s" if self._total and ok and self.mode != "install" else ""
         summary = f"{human_size(self._total)} in {human_time(elapsed)}{avg}"
         if cancelled:
             self.route.set_mode("ready", "Cancelled")
@@ -2512,10 +2902,11 @@ class App(tk.Tk):
         else:
             self.route.set_mode("done", word)
             self.progress.set(1.0, OK)
-            noun = "item" if ok == 1 else "items"
-            self.set_status(f"{word} {ok} {noun} to {dest}", "ok")
+            noun = ("app" if self.mode == "install" else "item") + ("" if ok == 1 else "s")
+            where = f" to {dest}" if dest else ""
+            self.set_status(f"{word} {ok} {noun}{where}", "ok")
             self.stats_lbl.configure(text=summary)
-            self.log_write(f"{word} {ok} {noun} to {dest}")
+            self.log_write(f"{word} {ok} {noun}{where}")
 
     def _drain_queue(self):
         try:
@@ -2534,6 +2925,8 @@ class App(tk.Tk):
                         self._update_count()
                 elif kind == "file":
                     self._active_list().set_state(msg[1], msg[2])
+                elif kind == "note":
+                    self._active_list().set_note(msg[1], msg[2])
                 elif kind == "rsize":
                     _k, path, n = msg
                     self.rsizes[path] = n
