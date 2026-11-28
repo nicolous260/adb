@@ -14,6 +14,8 @@ Run:  python adb_transfer.py
 """
 
 import ctypes
+import json
+import math
 import os
 import platform
 import posixpath
@@ -81,6 +83,15 @@ OK_WASH = "#16261D"
 WARN = "#D9C06A"
 BAD = "#F07582"
 BAD_WASH = "#2A1A1D"
+BAD_HI = "#3A2226"
+BAD_PRESS = "#4A2A2F"
+PRIMARY = "#ECEDEF"
+PRIMARY_HI = "#FFFFFF"
+PRIMARY_PRESS = "#C5C7CC"
+PRIMARY_FG = "#111214"
+DISABLED = "#1A1B1F"
+LOGFG = "#B4B7BE"
+THEME = "dark"
 
 SCALE = 1.0
 FAMILY = "Helvetica"
@@ -132,8 +143,13 @@ def font(size=10, weight="normal", mono=False):
     return _FONTS[key]
 
 
+def _colorref(hex_):
+    r, g, b = int(hex_[1:3], 16), int(hex_[3:5], 16), int(hex_[5:7], 16)
+    return (b << 16) | (g << 8) | r
+
+
 def style_titlebar(win):
-    """Dark title bar on Windows 10/11 so the frame matches the app."""
+    """Title bar that matches the app theme on Windows 10/11."""
     if sys.platform != "win32":
         return
     try:
@@ -145,10 +161,11 @@ def style_titlebar(win):
             v = ctypes.c_int(value)
             return dwm.DwmSetWindowAttribute(hwnd, attr, ctypes.byref(v), ctypes.sizeof(v))
 
-        if setattr_(20, 1) != 0:
-            setattr_(19, 1)
-        setattr_(35, 0x0012100F)  # caption colour (BBGGRR) = BG
-        setattr_(36, 0x00EFEDEC)  # caption text colour = TEXT
+        dark = 1 if THEME == "dark" else 0
+        if setattr_(20, dark) != 0:
+            setattr_(19, dark)
+        setattr_(35, _colorref(BG))  # caption colour
+        setattr_(36, _colorref(TEXT))  # caption text colour
     except Exception:
         pass
 
@@ -366,6 +383,71 @@ for _kind, _exts in {
         EXT_KIND[_e] = _kind
 
 
+PALETTE_KEYS = (
+    "BG SURFACE RAISED RAISED_HI LINE LINE_HI HAIR TEXT MUTED FAINT ACCENT ACCENT_HI ACCENT_PRESS "
+    "ACCENT_INK ACCENT_WASH LINK_IDLE OK OK_WASH WARN BAD BAD_WASH BAD_HI BAD_PRESS PRIMARY "
+    "PRIMARY_HI PRIMARY_PRESS PRIMARY_FG DISABLED LOGFG BADGES"
+).split()
+
+PALETTES = {"dark": {k: globals()[k] for k in PALETTE_KEYS}}
+PALETTES["light"] = dict(
+    BG="#F6F6F7", SURFACE="#FFFFFF", RAISED="#EDEEF0", RAISED_HI="#E2E3E7", LINE="#DCDDE1",
+    LINE_HI="#B9BBC2", HAIR="#E9EAEC", TEXT="#17181A", MUTED="#5F626A", FAINT="#9A9DA5",
+    ACCENT="#D98A1E", ACCENT_HI="#E59A33", ACCENT_PRESS="#C27813", ACCENT_INK="#1A1204",
+    ACCENT_WASH="#E2E3E7", LINK_IDLE="#B9BBC2", OK="#2E8B5B", OK_WASH="#DDF1E6", WARN="#8A6D10",
+    BAD="#C93C4D", BAD_WASH="#FBE4E7", BAD_HI="#F6D3D8", BAD_PRESS="#EFC0C7",
+    PRIMARY="#17181A", PRIMARY_HI="#000000", PRIMARY_PRESS="#3A3B3F", PRIMARY_FG="#FFFFFF",
+    DISABLED="#E9EAEC", LOGFG="#44474E",
+    BADGES={
+        "video": ("#E8E4FB", "#5B47B8"),
+        "image": ("#DDF3EA", "#1F7A56"),
+        "audio": ("#F8EBD4", "#9A6410"),
+        "archive": ("#F9E2E7", "#B23A55"),
+        "doc": ("#DCEEF8", "#1F6A94"),
+        "apk": ("#E3F3DC", "#3E7E2C"),
+        "folder": ("#E9EAEC", "#5F626A"),
+        "other": ("#E9EAEC", "#5F626A"),
+    },
+)
+
+
+def set_palette(name):
+    globals().update(PALETTES[name])
+    globals()["THEME"] = name
+
+
+PREFS_PATH = os.path.join(os.path.expanduser("~"), ".adb_file_transfer.json")
+
+
+def load_prefs():
+    try:
+        with open(PREFS_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def save_prefs(prefs):
+    try:
+        with open(PREFS_PATH, "w", encoding="utf-8") as f:
+            json.dump(prefs, f)
+    except Exception:
+        pass
+
+
+def system_theme():
+    """Windows app light/dark setting; dark elsewhere."""
+    if sys.platform == "win32":
+        try:
+            import winreg
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                                r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize") as k:
+                return "light" if winreg.QueryValueEx(k, "AppsUseLightTheme")[0] else "dark"
+        except Exception:
+            pass
+    return "dark"
+
+
 def badge_for(path, is_dir):
     if is_dir:
         return BADGES["folder"], ""
@@ -377,17 +459,20 @@ def badge_for(path, is_dir):
 class RButton(tk.Canvas):
     """Pill button drawn on a canvas: hover, press, focus ring, disabled."""
 
-    KINDS = {
-        "primary": dict(fill=TEXT, hover="#FFFFFF", press="#C5C7CC", fg="#111214", line=None),
-        "ghost": dict(fill=RAISED, hover=RAISED_HI, press=LINE, fg=TEXT, line=None),
-        "quiet": dict(fill=None, hover=RAISED, press=LINE, fg=MUTED, fgh=TEXT, line=None),
-        "danger": dict(fill=BAD_WASH, hover="#3A2226", press="#4A2A2F", fg=BAD, line=None),
-        "chip": dict(fill=None, hover=RAISED, press=LINE, fg=MUTED, fgh=TEXT, line=LINE),
-        "chip_on": dict(fill=RAISED_HI, hover=RAISED_HI, press=RAISED_HI, fg=TEXT, line=LINE_HI),
-    }
+    @staticmethod
+    def _kinds():
+        return {
+            "primary": dict(fill=PRIMARY, hover=PRIMARY_HI, press=PRIMARY_PRESS, fg=PRIMARY_FG, line=None),
+            "ghost": dict(fill=RAISED, hover=RAISED_HI, press=LINE, fg=TEXT, line=None),
+            "quiet": dict(fill=None, hover=RAISED, press=LINE, fg=MUTED, fgh=TEXT, line=None),
+            "danger": dict(fill=BAD_WASH, hover=BAD_HI, press=BAD_PRESS, fg=BAD, line=None),
+            "chip": dict(fill=None, hover=RAISED, press=LINE, fg=MUTED, fgh=TEXT, line=LINE),
+            "chip_on": dict(fill=RAISED_HI, hover=RAISED_HI, press=RAISED_HI, fg=TEXT, line=LINE_HI),
+        }
 
     def __init__(self, master, text, command=None, kind="ghost", height=36, pad=16,
-                 size=10, weight="normal", bg=BG, width=None, anchor="center"):
+                 size=10, weight="normal", bg=None, width=None, anchor="center"):
+        bg = BG if bg is None else bg
         self.fnt = font(size, weight)
         self.text = text
         self.pad = pad
@@ -447,7 +532,7 @@ class RButton(tk.Canvas):
 
     def _draw(self):
         self.delete("all")
-        w, h, k = self._bw, self._bh, self.KINDS[self.kind]
+        w, h, k = self._bw, self._bh, self._kinds()[self.kind]
         if self._enabled:
             fill = k["press"] if self._down else (k["hover"] if self._hover else k["fill"])
             fg = k.get("fgh", k["fg"]) if self._hover else k["fg"]
@@ -455,7 +540,7 @@ class RButton(tk.Canvas):
             if self.kind == "chip" and self._hover:
                 line = FAINT
         else:
-            fill = "#1A1B1F" if k["fill"] else None
+            fill = DISABLED if k["fill"] else None
             fg, line = FAINT, (HAIR if k["line"] else None)
         if fill or line:
             rrect(self, 1, 1, w - 1, h - 1, min(h / 2, px(10)), fill=fill or "", outline=line or "", width=1)
@@ -470,7 +555,9 @@ class RButton(tk.Canvas):
 class Field(tk.Canvas):
     """Rounded text field with a focus outline and optional placeholder."""
 
-    def __init__(self, master, textvariable=None, placeholder=None, bg=BG, fill=RAISED, mono=False):
+    def __init__(self, master, textvariable=None, placeholder=None, bg=None, fill=None, mono=False):
+        bg = BG if bg is None else bg
+        fill = RAISED if fill is None else fill
         super().__init__(master, height=px(40), bg=bg, highlightthickness=0, bd=0)
         self._fill, self._focus = fill, False
         self._ph_text, self._ph = placeholder, False
@@ -522,12 +609,19 @@ class Field(tk.Canvas):
     def value(self):
         return "" if self._ph else self.entry.get().strip()
 
+    def set_value(self, text):
+        self._ph = False
+        self.entry.configure(fg=TEXT)
+        self.entry.delete(0, "end")
+        self.entry.insert(0, text)
+
     def focus_field(self):
         self.entry.focus_set()
 
 
 class ProgressBar(tk.Canvas):
-    def __init__(self, master, bg=SURFACE):
+    def __init__(self, master, bg=None):
+        bg = SURFACE if bg is None else bg
         super().__init__(master, height=px(4), bg=bg, highlightthickness=0, bd=0)
         self.frac, self.color = 0.0, ACCENT
         self.bind("<Configure>", lambda e: self.draw())
@@ -553,7 +647,7 @@ class Route(tk.Canvas):
     while a transfer is running."""
 
     def __init__(self, master, hostname):
-        super().__init__(master, height=px(128), bg=BG, highlightthickness=0, bd=0)
+        super().__init__(master, height=px(136), bg=BG, highlightthickness=0, bd=0)
         self.host = hostname or "Computer"
         self.model = None
         self.sub = ""
@@ -819,7 +913,8 @@ class Row(tk.Canvas):
 class Segmented(tk.Canvas):
     """Two-way switch (To phone / From phone)."""
 
-    def __init__(self, master, options, command, bg=BG):
+    def __init__(self, master, options, command, bg=None):
+        bg = BG if bg is None else bg
         self.fnt = font(10, "bold")
         self.options, self.command, self.value = options, command, options[0][0]
         self.seg_w = [self.fnt.measure(lbl) + px(36) for _k, lbl in options]
@@ -959,6 +1054,54 @@ class FileList(tk.Frame):
                 row.redraw()
 
 
+class ThemeButton(tk.Canvas):
+    """Sun or moon: switches to the other theme."""
+
+    def __init__(self, master, command):
+        super().__init__(master, width=px(32), height=px(32), bg=BG, highlightthickness=0, bd=0,
+                         cursor="hand2", takefocus=1)
+        self.command = command
+        self._hover = self._focus = False
+        self.bind("<Enter>", lambda e: self._set(_hover=True))
+        self.bind("<Leave>", lambda e: self._set(_hover=False))
+        self.bind("<ButtonRelease-1>", lambda e: self.command())
+        self.bind("<FocusIn>", lambda e: self._set(_focus=True))
+        self.bind("<FocusOut>", lambda e: self._set(_focus=False))
+        self.bind("<Return>", lambda e: self.command())
+        self.bind("<space>", lambda e: self.command())
+        self.draw()
+
+    def _set(self, **kw):
+        for k, v in kw.items():
+            setattr(self, k, v)
+        self.draw()
+
+    def draw(self):
+        self.delete("all")
+        w = px(32)
+        bgc = RAISED if self._hover else BG
+        if self._hover:
+            rrect(self, 0, 0, w, w, px(10), fill=RAISED, outline="")
+        if self._focus:
+            rrect(self, 1, 1, w - 1, w - 1, px(10), fill="", outline=ACCENT_HI, width=2)
+        c = w / 2
+        col = TEXT if self._hover else MUTED
+        if THEME == "dark":  # offer light: sun
+            r = px(4)
+            self.create_oval(c - r, c - r, c + r, c + r, fill=col, outline="")
+            for i in range(8):
+                a = i * math.pi / 4
+                self.create_line(c + math.cos(a) * px(7), c + math.sin(a) * px(7),
+                                 c + math.cos(a) * px(10), c + math.sin(a) * px(10),
+                                 fill=col, width=2, capstyle="round")
+        else:  # offer dark: crescent moon
+            r = px(8)
+            self.create_oval(c - r, c - r, c + r, c + r, fill=col, outline="")
+            r2 = px(7)
+            self.create_oval(c + px(3) - r2, c - px(3) - r2, c + px(3) + r2, c - px(3) + r2,
+                             fill=bgc, outline="")
+
+
 class Modal(tk.Toplevel):
     def __init__(self, app, title, width=440):
         super().__init__(app)
@@ -994,6 +1137,10 @@ class Modal(tk.Toplevel):
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
+        self._prefs = load_prefs()
+        set_palette(self._prefs.get("theme") if self._prefs.get("theme") in PALETTES else system_theme())
+        self._status = ("Add files to get started", "normal")
+        self._log_history = []
         global SCALE
         SCALE = max(1.0, self.winfo_fpixels("1i") / 96.0)
         init_fonts(self)
@@ -1053,21 +1200,74 @@ class App(tk.Tk):
         self.after(300, self.refresh_devices)
 
     def _set_icon(self):
-        """Window and taskbar icon that follows the Windows light or dark app theme."""
-        dark = True
-        if sys.platform == "win32":
-            try:
-                import winreg
-                with winreg.OpenKey(winreg.HKEY_CURRENT_USER,
-                                    r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize") as k:
-                    dark = winreg.QueryValueEx(k, "AppsUseLightTheme")[0] == 0
-            except Exception:
-                pass
+        """Window and taskbar icon that follows the Windows light or dark app setting."""
+        dark = system_theme() == "dark"
         try:
             self._icon = tk.PhotoImage(data="".join(ICON_DARK if dark else ICON_LIGHT))
             self.iconphoto(True, self._icon)
         except tk.TclError:
             pass
+
+    def toggle_theme(self):
+        if self.sending:
+            self.set_status("Wait for the transfer to finish before changing the theme", "dim")
+            return
+        self.apply_theme("light" if THEME == "dark" else "dark")
+
+    def apply_theme(self, name):
+        """Switch palette and rebuild the window, keeping the user's state."""
+        snap = dict(
+            mode=self.mode,
+            rows={p: r.state for p, r in self.filelist.rows.items()},
+            status=self._status,
+            progress=(self.progress.frac, self.progress.color),
+            stats=self.stats_lbl.cget("text"),
+            route=(self.route.mode, self.route.center, self.route.reverse),
+            log_open=self._log_open,
+            wifi=self.wifi_field.value(),
+            send=self.send_btn.text,
+        )
+        set_palette(name)
+        self._prefs["theme"] = name
+        save_prefs(self._prefs)
+        self.configure(bg=BG)
+        for w in self.winfo_children():
+            w.destroy()
+        self._style()
+        self._build_ui()
+
+        self.device_combo["values"] = list(self.devices)
+        self._sync_chips()
+        self._update_adb_label()
+        if snap["wifi"]:
+            self.wifi_field.set_value(snap["wifi"])
+        for p in self.items:
+            row = self.filelist.add(p)
+            if p in self.sizes:
+                row.size_text = human_size(self.sizes[p])
+            row.state = snap["rows"].get(p, "queued")
+        self._show_stage()
+        for text, tag in self._log_history:
+            self._log_insert(text, tag)
+        if snap["log_open"]:
+            self._log_open = True
+            self.log_frame.grid(row=3, column=0, sticky="ew")
+            self.act_btn.set_text("Hide activity")
+        self._apply_device()
+        if snap["mode"] == "pull":
+            self.mode = "push"
+            self.set_direction("pull")
+        self.progress.set(*snap["progress"])
+        self.stats_lbl.configure(text=snap["stats"])
+        self.send_btn.set_text(snap["send"])
+        self.route.mode, self.route.center, self.route.reverse = snap["route"]
+        self.route.draw()
+        self._update_count()
+        if snap["mode"] == "pull":  # the phone list reloads, so the selection starts over
+            self.set_status("Click files or folders on the phone to select them", "dim")
+        else:
+            self.set_status(*snap["status"])
+        style_titlebar(self)
 
     # -------------------------------------------------------------- styling
     def _style(self):
@@ -1099,6 +1299,8 @@ class App(tk.Tk):
 
         self.route = Route(self, platform.node())
         self.route.grid(row=0, column=0, sticky="ew")
+        self.theme_btn = ThemeButton(self.route, self.toggle_theme)
+        self.theme_btn.place(relx=1.0, x=-px(12), y=px(8), anchor="ne")
 
         body = tk.Frame(self, bg=BG)
         body.grid(row=1, column=0, sticky="nsew")
@@ -1270,7 +1472,7 @@ class App(tk.Tk):
         wrap = tk.Frame(self.log_frame, bg=SURFACE, padx=px(28), pady=px(4))
         wrap.pack(fill="both", expand=True)
         wrap.columnconfigure(0, weight=1)
-        self.log = tk.Text(wrap, height=9, state="disabled", wrap="word", bg=SURFACE, fg="#B4B7BE",
+        self.log = tk.Text(wrap, height=9, state="disabled", wrap="word", bg=SURFACE, fg=LOGFG,
                            font=font(9, mono=True), relief="flat", bd=0, highlightthickness=0,
                            padx=0, pady=px(8), selectbackground=RAISED_HI, spacing1=px(2))
         sb = ttk.Scrollbar(wrap, orient="vertical", style="Dark.Vertical.TScrollbar", command=self.log.yview)
@@ -1310,6 +1512,11 @@ class App(tk.Tk):
             tag = "cmd"
         elif low.startswith(("done", "sent", "connected")):
             tag = "ok"
+        self._log_history.append((msg, tag))
+        del self._log_history[:-500]
+        self._log_insert(msg, tag)
+
+    def _log_insert(self, msg, tag):
         self.log.configure(state="normal")
         self.log.insert("end", msg + "\n", tag or ())
         self.log.see("end")
@@ -1317,6 +1524,7 @@ class App(tk.Tk):
 
     def set_status(self, text, tone="normal"):
         color = {"normal": TEXT, "ok": OK, "bad": BAD, "dim": MUTED}[tone]
+        self._status = (text, tone)
         self.status_lbl.configure(text=text, fg=color)
 
     def alert(self, title, body, tone="info"):
