@@ -6,7 +6,7 @@ REM Requires Python 3.8+ installed (with "Add Python to PATH" ticked).
 python -m pip install --upgrade pyinstaller qrcode windnd
 if errorlevel 1 goto :fail
 
-python -m PyInstaller --onefile --noconsole --name ADBFileTransfer adb_transfer.py
+python -m PyInstaller --onefile --noconsole --icon assets\icon-dark.ico --name ADBFileTransfer adb_transfer.py
 if errorlevel 1 goto :fail
 
 echo.

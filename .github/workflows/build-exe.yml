@@ -23,7 +23,7 @@ jobs:
         run: python -m pip install --upgrade pyinstaller qrcode windnd
 
       - name: Build exe
-        run: python -m PyInstaller --onefile --noconsole --name ADBFileTransfer adb_transfer.py
+        run: python -m PyInstaller --onefile --noconsole --icon assets/icon-dark.ico --name ADBFileTransfer adb_transfer.py
 
       - uses: actions/upload-artifact@v4
         with:
