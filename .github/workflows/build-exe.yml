@@ -30,6 +30,16 @@ jobs:
           name: ADBFileTransfer
           path: dist/ADBFileTransfer.exe
 
+      - name: Publish latest release (main)
+        if: github.ref == 'refs/heads/main'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest
+          name: Latest build
+          body: Newest ADBFileTransfer.exe, built from the main branch.
+          files: dist/ADBFileTransfer.exe
+          make_latest: true
+
       - name: Attach exe to release (tags only)
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
