@@ -1,9 +1,6 @@
 # ADB File Transfer
 
-<p>
-  <img src="assets/icon-dark.png" alt="" width="96">
-  <img src="assets/icon-light.png" alt="" width="96">
-</p>
+<img src="assets/icon-dark.png" alt="" width="96">
 
 A small Windows app for moving files between your PC and an Android phone over USB or Wi-Fi, using `adb`. It has a dark and a light theme.
 
