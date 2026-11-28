@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-ADB File Transfer - send files and folders from your PC to an Android phone
+ADB File Transfer - move files and folders between your PC and an Android phone
 over USB or Wi-Fi, using adb.
 
 Requirements:
@@ -16,7 +16,9 @@ Run:  python adb_transfer.py
 import ctypes
 import os
 import platform
+import posixpath
 import queue
+import re
 import secrets
 import shlex
 import shutil
@@ -58,30 +60,32 @@ ADB_ENV = dict(os.environ, ADB_MDNS_OPENSCREEN="1")
 
 # ---------------------------------------------------------------- design tokens
 # Deep ink-blue surfaces, one periwinkle accent, status colours kept for state.
-BG = "#0B121A"
-SURFACE = "#101A25"
-RAISED = "#172534"
-RAISED_HI = "#1E3043"
-LINE = "#223447"
-HAIR = "#142030"
-TEXT = "#E7EEF5"
-MUTED = "#8196AA"
-FAINT = "#4E6378"
-ACCENT = "#8AA4FF"
-ACCENT_HI = "#A7BBFF"
-ACCENT_PRESS = "#7490F0"
-ACCENT_INK = "#0A1230"
-ACCENT_WASH = "#16254A"
-LINK_IDLE = "#3A4F86"
-OK = "#5ED3A0"
-OK_WASH = "#12302A"
-WARN = "#F2C262"
-BAD = "#FF7A8A"
-BAD_WASH = "#2B1822"
+BG = "#0F1012"
+SURFACE = "#151619"
+RAISED = "#1B1C20"
+RAISED_HI = "#25272C"
+LINE = "#2A2C31"
+LINE_HI = "#4A4D55"
+HAIR = "#1C1D21"
+TEXT = "#ECEDEF"
+MUTED = "#9A9DA5"
+FAINT = "#5F626A"
+ACCENT = "#E9A23B"  # signal amber: live transfer, progress, selection mark
+ACCENT_HI = "#F2B65C"
+ACCENT_PRESS = "#D18F2F"
+ACCENT_INK = "#1A1204"
+ACCENT_WASH = "#25272C"
+LINK_IDLE = "#4A4D55"
+OK = "#6FCF97"
+OK_WASH = "#16261D"
+WARN = "#D9C06A"
+BAD = "#F07582"
+BAD_WASH = "#2A1A1D"
 
 SCALE = 1.0
 FAMILY = "Helvetica"
 MONO = "Courier"
+SEMI = None  # semibold family when the system has one
 _FONTS = {}
 
 
@@ -103,13 +107,15 @@ def enable_dpi_awareness():
 
 
 def init_fonts(root):
-    global FAMILY, MONO
+    global FAMILY, MONO, SEMI
     avail = set(tkfont.families(root))
     for name in ("Segoe UI Variable Text", "Segoe UI", "SF Pro Text", "Inter",
                  "Helvetica Neue", "Cantarell", "Noto Sans", "DejaVu Sans"):
         if name in avail:
             FAMILY = name
             break
+    if FAMILY.startswith("Segoe UI") and "Segoe UI Semibold" in avail:
+        SEMI = "Segoe UI Semibold"
     for name in ("Cascadia Mono", "Consolas", "SF Mono", "Menlo", "DejaVu Sans Mono"):
         if name in avail:
             MONO = name
@@ -119,7 +125,10 @@ def init_fonts(root):
 def font(size=10, weight="normal", mono=False):
     key = (size, weight, mono)
     if key not in _FONTS:
-        _FONTS[key] = tkfont.Font(family=MONO if mono else FAMILY, size=size, weight=weight)
+        if weight == "bold" and SEMI and not mono:
+            _FONTS[key] = tkfont.Font(family=SEMI, size=size, weight="normal")
+        else:
+            _FONTS[key] = tkfont.Font(family=MONO if mono else FAMILY, size=size, weight=weight)
     return _FONTS[key]
 
 
@@ -138,8 +147,8 @@ def style_titlebar(win):
 
         if setattr_(20, 1) != 0:
             setattr_(19, 1)
-        setattr_(35, 0x001A120B)  # caption colour (BBGGRR) = BG
-        setattr_(36, 0x00F5EEE7)  # caption text colour = TEXT
+        setattr_(35, 0x0012100F)  # caption colour (BBGGRR) = BG
+        setattr_(36, 0x00EFEDEC)  # caption text colour = TEXT
     except Exception:
         pass
 
@@ -203,6 +212,38 @@ def rrect(c, x1, y1, x2, y2, r, **kw):
     return c.create_polygon(pts, smooth=True, **kw)
 
 
+LS_RE = re.compile(
+    r"^([\-dlcbps])[rwxsStT\-]{9}\S*\s+(?:\d+\s+)?\S+\s+\S+\s+(?:(\d+)\s+)?"
+    r"(\d{4}-\d\d-\d\d)\s+(\d\d:\d\d)\s+(.*)$")
+
+
+def parse_ls(text):
+    """Parse `adb shell ls -lA` output into (entries, error lines)."""
+    entries, errors = [], []
+    for line in text.splitlines():
+        line = line.rstrip("\r")
+        if not line.strip() or line.startswith("total "):
+            continue
+        m = LS_RE.match(line)
+        if not m:
+            errors.append(line.strip())
+            continue
+        kind, size, date, tm, name = m.groups()
+        if kind == "l" and " -> " in name:
+            name = name.split(" -> ")[0]
+        entries.append({"name": name, "dir": kind in ("d", "l"),
+                        "size": int(size or 0), "meta": f"{date} {tm}"})
+    entries.sort(key=lambda e: (not e["dir"], e["name"].lower()))
+    return entries, errors
+
+
+def pc_places():
+    home = os.path.expanduser("~")
+    out = [(n, os.path.join(home, n)) for n in ("Downloads", "Desktop", "Documents", "Pictures")
+           if os.path.isdir(os.path.join(home, n))]
+    return out or [("Home", home)]
+
+
 def find_adb():
     exe = "adb.exe" if sys.platform == "win32" else "adb"
     base = os.path.dirname(sys.executable if getattr(sys, "frozen", False)
@@ -221,8 +262,8 @@ BADGES = {
     "archive": ("#3A1F2B", "#FF9AAE"),
     "doc": ("#14303F", "#7FCBF2"),
     "apk": ("#1E3A22", "#9BE58A"),
-    "folder": ("#222D3B", "#9FB3C6"),
-    "other": ("#1B2837", "#9FB3C6"),
+    "folder": ("#26282C", "#A9ACB3"),
+    "other": ("#222428", "#A9ACB3"),
 }
 EXT_KIND = {}
 for _kind, _exts in {
@@ -249,12 +290,12 @@ class RButton(tk.Canvas):
     """Pill button drawn on a canvas: hover, press, focus ring, disabled."""
 
     KINDS = {
-        "primary": dict(fill=ACCENT, hover=ACCENT_HI, press=ACCENT_PRESS, fg=ACCENT_INK, line=None),
+        "primary": dict(fill=TEXT, hover="#FFFFFF", press="#C5C7CC", fg="#111214", line=None),
         "ghost": dict(fill=RAISED, hover=RAISED_HI, press=LINE, fg=TEXT, line=None),
         "quiet": dict(fill=None, hover=RAISED, press=LINE, fg=MUTED, fgh=TEXT, line=None),
-        "danger": dict(fill=BAD_WASH, hover="#3A2030", press="#4A2838", fg=BAD, line=None),
+        "danger": dict(fill=BAD_WASH, hover="#3A2226", press="#4A2A2F", fg=BAD, line=None),
         "chip": dict(fill=None, hover=RAISED, press=LINE, fg=MUTED, fgh=TEXT, line=LINE),
-        "chip_on": dict(fill=ACCENT_WASH, hover=ACCENT_WASH, press=ACCENT_WASH, fg=ACCENT_HI, line=ACCENT),
+        "chip_on": dict(fill=RAISED_HI, hover=RAISED_HI, press=RAISED_HI, fg=TEXT, line=LINE_HI),
     }
 
     def __init__(self, master, text, command=None, kind="ghost", height=36, pad=16,
@@ -326,12 +367,12 @@ class RButton(tk.Canvas):
             if self.kind == "chip" and self._hover:
                 line = FAINT
         else:
-            fill = "#131E2A" if k["fill"] else None
+            fill = "#1A1B1F" if k["fill"] else None
             fg, line = FAINT, (HAIR if k["line"] else None)
         if fill or line:
-            rrect(self, 1, 1, w - 1, h - 1, h / 2, fill=fill or "", outline=line or "", width=1)
+            rrect(self, 1, 1, w - 1, h - 1, min(h / 2, px(10)), fill=fill or "", outline=line or "", width=1)
         if self._focus:
-            rrect(self, 2, 2, w - 2, h - 2, h / 2, fill="", outline=ACCENT_HI, width=2)
+            rrect(self, 2, 2, w - 2, h - 2, min(h / 2, px(10)), fill="", outline=ACCENT_HI, width=2)
         if self.anchor_ == "w":
             self.create_text(px(self.pad), h / 2, text=self.text, font=self.fnt, fill=fg, anchor="w")
         else:
@@ -399,7 +440,7 @@ class Field(tk.Canvas):
 
 class ProgressBar(tk.Canvas):
     def __init__(self, master, bg=SURFACE):
-        super().__init__(master, height=px(6), bg=bg, highlightthickness=0, bd=0)
+        super().__init__(master, height=px(4), bg=bg, highlightthickness=0, bd=0)
         self.frac, self.color = 0.0, ACCENT
         self.bind("<Configure>", lambda e: self.draw())
 
@@ -414,7 +455,7 @@ class ProgressBar(tk.Canvas):
         w, h = self.winfo_width(), self.winfo_height()
         if w < 4:
             return
-        rrect(self, 0, 0, w, h, h / 2, fill="#16232F", outline="")
+        rrect(self, 0, 0, w, h, h / 2, fill=RAISED, outline="")
         if self.frac > 0:
             rrect(self, 0, 0, max(w * self.frac, h), h, h / 2, fill=self.color, outline="")
 
@@ -431,6 +472,7 @@ class Route(tk.Canvas):
         self.mode = "idle"  # idle | ready | sending | done | error
         self.center = "Not connected"
         self.offset = 0
+        self.reverse = False  # True when data flows phone -> PC
         self.bind("<Configure>", lambda e: self.draw())
 
     def set_device(self, model, sub=""):
@@ -449,7 +491,7 @@ class Route(tk.Canvas):
         self.draw()
 
     def advance(self):
-        self.offset -= px(2)
+        self.offset += px(2) if self.reverse else -px(2)
         try:
             self.itemconfigure("flow", dashoffset=self.offset)
         except tk.TclError:
@@ -471,7 +513,7 @@ class Route(tk.Canvas):
         self.create_line(mx + mw / 2, my + mh, mx + mw / 2, my + mh + px(5), fill=MUTED, width=2)
         self.create_line(mx + mw * 0.3, my + mh + px(5), mx + mw * 0.7, my + mh + px(5),
                          fill=MUTED, width=2, capstyle="round")
-        lx = pad + mw + px(14)
+        lx = pad + mw + px(16)
         host = ellipsize(self.host, sub_f, px(150))
         self.create_text(lx, cy - px(9), text="This PC", anchor="w", font=name_f, fill=TEXT)
         self.create_text(lx, cy + px(11), text=host, anchor="w", font=sub_f, fill=MUTED)
@@ -480,9 +522,9 @@ class Route(tk.Canvas):
         pw, ph = px(26), px(46)
         phx = w - pad - pw
         rrect(self, phx, cy - ph // 2, phx + pw, cy + ph // 2, px(7),
-              fill=ACCENT_WASH if connected else "", outline=ACCENT_HI if connected else FAINT, width=2)
+              fill=RAISED if connected else "", outline=TEXT if connected else FAINT, width=2)
         self.create_line(phx + pw * 0.34, cy - ph // 2 + px(7), phx + pw * 0.66, cy - ph // 2 + px(7),
-                         fill=ACCENT_HI if connected else FAINT, width=2, capstyle="round")
+                         fill=TEXT if connected else FAINT, width=2, capstyle="round")
         rx = phx - px(16)
         title = ellipsize(self.model or "No phone connected", name_f, px(240))
         sub = ellipsize(self.sub if connected else "Connect by USB or Wi-Fi", sub_f, px(240))
@@ -506,7 +548,7 @@ class Route(tk.Canvas):
                 col = BAD
             elif connected:
                 self.create_line(x1, cy, x2, cy, fill=LINK_IDLE, width=2)
-                col = ACCENT
+                col = MUTED
             else:
                 self.create_line(x1, cy, x2, cy, fill=FAINT, width=2, dash=(2, 7), capstyle="round")
                 col = FAINT
@@ -531,41 +573,41 @@ class DropZone(tk.Canvas):
         w, h = self.winfo_width(), self.winfo_height()
         if w < 120 or h < 120:
             return
-        rrect(self, 2, 2, w - 2, h - 2, px(22), fill=SURFACE, outline=LINE, width=2, dash=(7, 6))
-        cx = w / 2
-        top = max(px(20), h / 2 - px(92))
-        # tray with arrow dropping in
-        a0 = top
-        self.create_line(cx, a0, cx, a0 + px(26), fill=ACCENT, width=3, capstyle="round")
-        self.create_line(cx - px(9), a0 + px(17), cx, a0 + px(27), cx + px(9), a0 + px(17),
-                         fill=ACCENT, width=3, capstyle="round", joinstyle="round")
-        self.create_line(cx - px(20), a0 + px(22), cx - px(20), a0 + px(38), cx + px(20), a0 + px(38),
-                         cx + px(20), a0 + px(22), fill=MUTED, width=3, capstyle="round", joinstyle="round")
+        rrect(self, 1, 1, w - 1, h - 1, px(16), fill=SURFACE, outline=LINE, width=1)
+        x0 = px(44)
+        top = max(px(26), h / 2 - px(60))
         title = "Drop files or folders here" if self.can_drop else "Add files or folders"
-        self.create_text(cx, a0 + px(68), text=title, font=font(15, "bold"), fill=TEXT)
-        self.create_text(cx, a0 + px(94), text="They are copied to your phone over USB or Wi-Fi.",
-                         font=font(10), fill=MUTED)
-        by = a0 + px(138)
+        self.create_text(x0, top, text=title, anchor="w", font=font(18, "bold"), fill=TEXT)
+        self.create_text(x0, top + px(34), anchor="w", font=font(10), fill=MUTED,
+                         text="They go to the phone folder chosen on the right")
+        by = top + px(90)
         gap = px(10)
-        w1, w2 = int(self.b1["width"]), int(self.b2["width"])
-        self.create_window(cx - (w1 + w2 + gap) / 2, by, window=self.b1, anchor="w")
-        self.create_window(cx + (w1 + w2 + gap) / 2, by, window=self.b2, anchor="e")
+        self.create_window(x0, by, window=self.b1, anchor="w")
+        self.create_window(x0 + int(self.b1["width"]) + gap, by, window=self.b2, anchor="w")
 
 
 class Row(tk.Canvas):
-    """One queued file or folder."""
+    """One queued file or folder (on the PC), or one entry on the phone."""
 
-    def __init__(self, master, path, on_remove):
-        super().__init__(master, height=px(60), bg=BG, highlightthickness=0, bd=0)
+    def __init__(self, master, path, on_remove, remote=False, is_dir=False, meta="",
+                 size_text="…", on_toggle=None, on_open=None):
+        super().__init__(master, height=px(64), bg=BG, highlightthickness=0, bd=0)
         self.path = path
-        self.on_remove = on_remove
-        self.is_dir = os.path.isdir(path)
-        stripped = path.rstrip("/\\")
-        self.name = os.path.basename(stripped) or path
-        self.parent = os.path.dirname(stripped)
-        self.size_text = "…"
+        self.on_remove, self.on_toggle, self.on_open = on_remove, on_toggle, on_open
+        self.remote = remote
+        if remote:
+            self.is_dir = bool(is_dir)
+            self.name = posixpath.basename(path.rstrip("/")) or path
+            self.parent = meta
+        else:
+            self.is_dir = os.path.isdir(path)
+            stripped = path.rstrip("/\\")
+            self.name = os.path.basename(stripped) or path
+            self.parent = os.path.dirname(stripped)
+        self.size_text = size_text
         self.state = "queued"
         self.removable = True
+        self.selected = False
         self.hover = False
         self.phase = 0
         self.bind("<Configure>", lambda e: self.redraw())
@@ -573,6 +615,7 @@ class Row(tk.Canvas):
         self.bind("<Leave>", lambda e: self._hover(False))
         self.bind("<Motion>", self._motion)
         self.bind("<ButtonRelease-1>", self._click)
+        self.bind("<Double-Button-1>", self._double)
 
     def _hover(self, on):
         self.hover = on
@@ -587,11 +630,26 @@ class Row(tk.Canvas):
         return self.state == "queued" and self.removable
 
     def _motion(self, e):
-        self.configure(cursor="hand2" if self._in_tail(e.x) and self._can_remove() else "")
+        if self.remote:
+            self.configure(cursor="hand2" if self._can_remove() else "")
+        else:
+            self.configure(cursor="hand2" if self._in_tail(e.x) and self._can_remove() else "")
 
     def _click(self, e):
-        if self._in_tail(e.x) and self._can_remove():
+        if not self._can_remove():
+            return
+        if self.remote:
+            if self.is_dir and self._in_tail(e.x):
+                if self.on_open:
+                    self.on_open(self.path)
+            elif self.on_toggle:
+                self.on_toggle(self.path)
+        elif self._in_tail(e.x):
             self.on_remove(self.path)
+
+    def _double(self, e):
+        if self.remote and self.is_dir and self._can_remove() and self.on_open:
+            self.on_open(self.path)
 
     def set_state(self, state):
         self.state = state
@@ -602,13 +660,24 @@ class Row(tk.Canvas):
         w, h = self.winfo_width(), self.winfo_height()
         if w < 60:
             return
-        if self.hover:
+        if self.selected:
+            rrect(self, 0, 3, w, h - 3, px(12), fill=RAISED, outline=LINE_HI, width=1)
+        elif self.hover:
             rrect(self, 0, 3, w, h - 3, px(12), fill=SURFACE, outline="")
         else:
             self.create_line(px(62), h - 1, w - px(6), h - 1, fill=HAIR)
+        lead = px(30) if self.remote else 0
+        if self.remote:  # selection marker
+            cx, cy, r = px(22), h / 2, px(8)
+            if self.selected:
+                self.create_oval(cx - r, cy - r, cx + r, cy + r, fill=ACCENT, outline="")
+                self.create_line(cx - px(3.5), cy, cx - px(1), cy + px(3), cx + px(4), cy - px(3),
+                                 fill=ACCENT_INK, width=2, capstyle="round", joinstyle="round")
+            else:
+                self.create_oval(cx - r, cy - r, cx + r, cy + r, outline=FAINT if self.hover else LINE, width=2)
         # badge
-        bs = px(38)
-        bx, by = px(10), (h - bs) // 2
+        bs = px(40)
+        bx, by = px(12) + lead, (h - bs) // 2
         (tint, fg), label = badge_for(self.path, self.is_dir)
         rrect(self, bx, by, bx + bs, by + bs, px(10), fill=tint, outline="")
         if self.is_dir:
@@ -616,17 +685,20 @@ class Row(tk.Canvas):
             self.create_polygon(x0, y1, x0, y0, x0 + (x1 - x0) * 0.42, y0, x0 + (x1 - x0) * 0.56, y0 + px(4),
                                 x1, y0 + px(4), x1, y1, fill="", outline=fg, width=2, joinstyle="round")
         else:
-            self.create_text(bx + bs / 2, by + bs / 2, text=label, font=font(8, "bold"), fill=fg)
+            self.create_text(bx + bs / 2, by + bs / 2, text=label, font=font(9, "bold"), fill=fg)
         # text
         tx = bx + bs + px(14)
         size_right = w - px(58)
         maxw = size_right - px(84) - tx
         self.create_text(tx, h / 2 - px(9), text=ellipsize(self.name, font(10), maxw), anchor="w",
                          font=font(10), fill=TEXT)
-        sub = self.parent or ("Folder" if self.is_dir else "")
+        if self.remote:
+            sub = self.parent
+        else:
+            sub = self.parent or ("Folder" if self.is_dir else "")
         self.create_text(tx, h / 2 + px(11), text=ellipsize(sub, font(9), maxw, keep="end"),
                          anchor="w", font=font(9), fill=MUTED)
-        self.create_text(size_right, h / 2, text=self.size_text, anchor="e", font=font(9), fill=MUTED)
+        self.create_text(size_right, h / 2, text=self.size_text, anchor="e", font=font(9, mono=True), fill=MUTED)
         # tail
         cx, cy, r = w - px(26), h / 2, px(9)
         st = self.state
@@ -642,12 +714,70 @@ class Row(tk.Canvas):
             self.create_oval(cx - r, cy - r, cx + r, cy + r, fill=BAD_WASH, outline="")
             self.create_line(cx, cy - px(4), cx, cy + px(1), fill=BAD, width=2, capstyle="round")
             self.create_oval(cx - 1, cy + px(3) - 1, cx + 1, cy + px(3) + 1, fill=BAD, outline="")
+        elif self.remote:
+            if self.is_dir:  # chevron: open this folder
+                d = px(4)
+                self.create_line(cx - d / 2, cy - d - 1, cx + d / 2, cy, cx - d / 2, cy + d + 1,
+                                 fill=TEXT if self.hover else MUTED, width=2, capstyle="round",
+                                 joinstyle="round")
         elif self.hover and self.removable:
             d = px(4)
             self.create_line(cx - d, cy - d, cx + d, cy + d, fill=TEXT, width=2, capstyle="round")
             self.create_line(cx - d, cy + d, cx + d, cy - d, fill=TEXT, width=2, capstyle="round")
         else:
             self.create_oval(cx - px(3), cy - px(3), cx + px(3), cy + px(3), fill=FAINT, outline="")
+
+
+class Segmented(tk.Canvas):
+    """Two-way switch (To phone / From phone)."""
+
+    def __init__(self, master, options, command, bg=BG):
+        self.fnt = font(10, "bold")
+        self.options, self.command, self.value = options, command, options[0][0]
+        self.seg_w = [self.fnt.measure(lbl) + px(36) for _k, lbl in options]
+        super().__init__(master, width=sum(self.seg_w) + px(8), height=px(40), bg=bg,
+                         highlightthickness=0, bd=0, cursor="hand2", takefocus=1)
+        self._focus = False
+        self.bind("<Configure>", lambda e: self.draw())
+        self.bind("<Button-1>", self._click)
+        self.bind("<FocusIn>", lambda e: self._set_focus(True))
+        self.bind("<FocusOut>", lambda e: self._set_focus(False))
+        self.bind("<Left>", lambda e: self._step(-1))
+        self.bind("<Right>", lambda e: self._step(1))
+
+    def _set_focus(self, on):
+        self._focus = on
+        self.draw()
+
+    def _step(self, d):
+        keys = [k for k, _l in self.options]
+        i = min(max(keys.index(self.value) + d, 0), len(keys) - 1)
+        self.command(keys[i])
+
+    def set(self, key):
+        self.value = key
+        self.draw()
+
+    def _click(self, e):
+        x = px(4)
+        for (key, _lbl), w in zip(self.options, self.seg_w):
+            if x <= e.x < x + w:
+                self.command(key)
+                return
+            x += w
+
+    def draw(self):
+        self.delete("all")
+        w, h = self.winfo_width(), self.winfo_height()
+        rrect(self, 1, 1, w - 1, h - 1, px(11), fill=SURFACE,
+              outline=ACCENT_HI if self._focus else LINE, width=2 if self._focus else 1)
+        x = px(4)
+        for (key, lbl), sw in zip(self.options, self.seg_w):
+            on = key == self.value
+            if on:
+                rrect(self, x, px(4), x + sw, h - px(4), px(8), fill=RAISED_HI, outline=LINE_HI, width=1)
+            self.create_text(x + sw / 2, h / 2, text=lbl, font=self.fnt, fill=TEXT if on else MUTED)
+            x += sw
 
 
 class FileList(tk.Frame):
@@ -689,8 +819,8 @@ class FileList(tk.Frame):
         if self.sb.winfo_ismapped():
             self.canvas.yview_scroll(int(-e.delta / 120) * 2 or (-2 if e.delta > 0 else 2), "units")
 
-    def add(self, path):
-        row = Row(self.inner, path, self.on_remove)
+    def add(self, path, **kw):
+        row = Row(self.inner, path, self.on_remove, **kw)
         row.pack(fill="x")
         self.rows[path] = row
         return row
@@ -789,6 +919,13 @@ class App(tk.Tk):
         self.adb_path = tk.StringVar(value=find_adb())
         self.device_var = tk.StringVar()
         self.dest_var = tk.StringVar(value=DEFAULT_DEST)
+        self.save_var = tk.StringVar(value=pc_places()[0][1])
+        self.mode = "push"  # push: PC -> phone, pull: phone -> PC
+        self.remote_path = "/sdcard/"
+        self.sel = []  # selected phone paths (pull)
+        self.rsizes = {}
+        self.rdirs = set()
+        self._browse_gen = 0
 
         self.items = []  # absolute paths to transfer
         self.sizes = {}  # path -> bytes (once known)
@@ -818,6 +955,7 @@ class App(tk.Tk):
         self._build_ui()
         self.protocol("WM_DELETE_WINDOW", self._close)
         self.dest_var.trace_add("write", lambda *_: self._sync_chips())
+        self.save_var.trace_add("write", lambda *_: self._sync_chips())
         self.device_var.trace_add("write", lambda *_: self._apply_device())
         self._sync_chips()
         self._update_adb_label()
@@ -844,8 +982,8 @@ class App(tk.Tk):
               bordercolor=[("focus", ACCENT)], arrowcolor=[("hover", TEXT)])
         self.option_add("*TCombobox*Listbox.background", RAISED)
         self.option_add("*TCombobox*Listbox.foreground", TEXT)
-        self.option_add("*TCombobox*Listbox.selectBackground", ACCENT_WASH)
-        self.option_add("*TCombobox*Listbox.selectForeground", ACCENT_HI)
+        self.option_add("*TCombobox*Listbox.selectBackground", RAISED_HI)
+        self.option_add("*TCombobox*Listbox.selectForeground", TEXT)
         self.option_add("*TCombobox*Listbox.font", font(10))
 
     # ------------------------------------------------------------------ UI
@@ -868,66 +1006,107 @@ class App(tk.Tk):
         self._build_log()
 
     def _build_files(self, parent):
-        f = tk.Frame(parent, bg=BG, padx=px(28), pady=px(22))
+        f = tk.Frame(parent, bg=BG, padx=px(28), pady=px(24))
         f.columnconfigure(0, weight=1)
         f.rowconfigure(1, weight=1)
 
         bar = tk.Frame(f, bg=BG)
         bar.grid(row=0, column=0, sticky="ew", pady=(0, px(12)))
-        tk.Label(bar, text="Files", font=font(14, "bold"), bg=BG, fg=TEXT).pack(side="left")
-        self.count_lbl = tk.Label(bar, text="", font=font(10), bg=BG, fg=MUTED)
-        self.count_lbl.pack(side="left", padx=(px(12), 0), pady=(px(3), 0))
+        self.seg = Segmented(bar, [("push", "To phone"), ("pull", "From phone")], self.set_direction)
+        self.seg.pack(side="left")
+        self.count_lbl = tk.Label(bar, text="", font=font(9, mono=True), bg=BG, fg=MUTED)
+        self.count_lbl.pack(side="left", padx=(px(12), 0), pady=(px(4), 0))
         self.tools = tk.Frame(bar, bg=BG)
         RButton(self.tools, "Clear", self.clear_items, "quiet", height=32, pad=12).pack(side="right")
         RButton(self.tools, "Add folder", self.add_folder, "ghost", height=32, pad=14).pack(
             side="right", padx=px(8))
         RButton(self.tools, "Add files", self.add_files, "ghost", height=32, pad=14).pack(side="right")
 
-        stage = tk.Frame(f, bg=BG)
+        stage = self.push_stage = tk.Frame(f, bg=BG)
         stage.grid(row=1, column=0, sticky="nsew")
         stage.columnconfigure(0, weight=1)
         stage.rowconfigure(0, weight=1)
         self.dropzone = DropZone(stage, self.add_files, self.add_folder, self.can_drop)
         self.filelist = FileList(stage, self.remove_path)
         self.dropzone.grid(row=0, column=0, sticky="nsew")
+
+        # phone browser (From phone)
+        ps = self.pull_stage = tk.Frame(f, bg=BG)
+        ps.columnconfigure(0, weight=1)
+        ps.rowconfigure(1, weight=1)
+        pbar = tk.Frame(ps, bg=BG)
+        pbar.grid(row=0, column=0, sticky="ew", pady=(0, px(8)))
+        self.up_btn = RButton(pbar, "Up", self.browse_up, "ghost", height=32, pad=16)
+        self.up_btn.pack(side="left")
+        RButton(pbar, "Reload", lambda: self.browse(self.remote_path), "quiet", height=32, pad=12).pack(side="right")
+        self.path_lbl = tk.Label(pbar, text="", font=font(10, mono=True), bg=BG, fg=MUTED, anchor="w")
+        self.path_lbl.pack(side="left", fill="x", expand=True, padx=px(12))
+        self.phonelist = FileList(ps, None)
+        self.phonelist.grid(row=1, column=0, sticky="nsew")
+        self.browse_msg = tk.Label(ps, text="", font=font(10), bg=BG, fg=MUTED, justify="center")
         return f
 
     def _section(self, parent, title, first=False):
-        tk.Label(parent, text=title, font=font(11, "bold"), bg=BG, fg=TEXT, anchor="w").pack(
-            fill="x", pady=(0 if first else px(26), px(10)))
+        lbl = tk.Label(parent, text=title, font=font(12, "bold"), bg=BG, fg=TEXT, anchor="w")
+        lbl.pack(fill="x", pady=(0 if first else px(24), px(8)))
+        return lbl
 
     def _build_side(self, parent):
         side = tk.Frame(parent, bg=BG, width=px(344))
         side.pack_propagate(False)
         inner = tk.Frame(side, bg=BG)
-        inner.pack(fill="both", expand=True, padx=px(24), pady=px(22))
+        inner.pack(fill="both", expand=True, padx=px(24), pady=px(24))
 
-        # destination
-        self._section(inner, "Send to", first=True)
-        grid = tk.Frame(inner, bg=BG)
+        # destination (phone folder when sending, PC folder when saving)
+        self.side_title = self._section(inner, "Send to", first=True)
+        holder = tk.Frame(inner, bg=BG)
+        holder.pack(fill="x")
+
+        self.push_dest = tk.Frame(holder, bg=BG)
+        grid = tk.Frame(self.push_dest, bg=BG)
         grid.pack(fill="x")
         grid.columnconfigure((0, 1), weight=1, uniform="chips")
         self.chips = {}
         for i, (label, path) in enumerate(PRESETS):
-            b = RButton(grid, label, lambda p=path: self.dest_var.set(p), "chip", height=34, pad=12)
+            b = RButton(grid, label, lambda p=path: self.dest_var.set(p), "chip", height=36, pad=12)
             b.grid(row=i // 2, column=i % 2, sticky="ew",
-                   padx=(0, px(4)) if i % 2 == 0 else (px(4), 0), pady=px(3))
+                   padx=(0, px(4)) if i % 2 == 0 else (px(4), 0), pady=px(4))
             self.chips[path] = b
-        tk.Label(inner, text="Folder on the phone", font=font(9), bg=BG, fg=MUTED, anchor="w").pack(
-            fill="x", pady=(px(14), px(6)))
-        Field(inner, textvariable=self.dest_var, mono=True).pack(fill="x")
+        tk.Label(self.push_dest, text="Folder on the phone", font=font(9), bg=BG, fg=MUTED,
+                 anchor="w").pack(fill="x", pady=(px(16), px(8)))
+        Field(self.push_dest, textvariable=self.dest_var, mono=True).pack(fill="x")
+        self.push_dest.pack(fill="x")
+
+        self.pull_dest = tk.Frame(holder, bg=BG)
+        pgrid = tk.Frame(self.pull_dest, bg=BG)
+        pgrid.pack(fill="x")
+        pgrid.columnconfigure((0, 1), weight=1, uniform="pchips")
+        self.save_chips = {}
+        for i, (label, path) in enumerate(pc_places()):
+            b = RButton(pgrid, label, lambda p=path: self.save_var.set(p), "chip", height=36, pad=12)
+            b.grid(row=i // 2, column=i % 2, sticky="ew",
+                   padx=(0, px(4)) if i % 2 == 0 else (px(4), 0), pady=px(4))
+            self.save_chips[path] = b
+        tk.Label(self.pull_dest, text="Folder on this PC", font=font(9), bg=BG, fg=MUTED,
+                 anchor="w").pack(fill="x", pady=(px(16), px(8)))
+        prow = tk.Frame(self.pull_dest, bg=BG)
+        prow.pack(fill="x")
+        prow.columnconfigure(0, weight=1)
+        Field(prow, textvariable=self.save_var, mono=True).grid(row=0, column=0, sticky="ew")
+        RButton(prow, "Browse", self.browse_save, "ghost", height=40, pad=16).grid(
+            row=0, column=1, padx=(px(8), 0))
 
         # connection
         head = tk.Frame(inner, bg=BG)
-        head.pack(fill="x", pady=(px(26), px(10)))
-        tk.Label(head, text="Phone", font=font(11, "bold"), bg=BG, fg=TEXT).pack(side="left")
+        head.pack(fill="x", pady=(px(24), px(8)))
+        tk.Label(head, text="Phone", font=font(12, "bold"), bg=BG, fg=TEXT).pack(side="left")
         RButton(head, "Refresh", self.refresh_devices, "quiet", height=28, pad=10, size=9).pack(side="right")
         self.device_combo = ttk.Combobox(inner, textvariable=self.device_var, state="readonly",
                                          font=font(10))
-        self.device_combo.pack(fill="x", ipady=px(3))
+        self.device_combo.pack(fill="x", ipady=px(4))
 
         row = tk.Frame(inner, bg=BG)
-        row.pack(fill="x", pady=(px(10), 0))
+        row.pack(fill="x", pady=(px(8), 0))
         row.columnconfigure((0, 1), weight=1, uniform="pair")
         RButton(row, "Scan QR", self.qr_connect, "ghost", height=36).grid(
             row=0, column=0, sticky="ew", padx=(0, px(4)))
@@ -935,7 +1114,7 @@ class App(tk.Tk):
             row=0, column=1, sticky="ew", padx=(px(4), 0))
 
         tk.Label(inner, text="Wi-Fi address", font=font(9), bg=BG, fg=MUTED, anchor="w").pack(
-            fill="x", pady=(px(16), px(6)))
+            fill="x", pady=(px(16), px(8)))
         wrow = tk.Frame(inner, bg=BG)
         wrow.pack(fill="x")
         wrow.columnconfigure(0, weight=1)
@@ -968,16 +1147,16 @@ class App(tk.Tk):
         self.status_lbl.pack(side="left", fill="x", expand=True)
         self.act_btn = RButton(top, "Activity", self.toggle_log, "quiet", height=26, pad=10, size=9, bg=SURFACE)
         self.act_btn.pack(side="right")
-        self.stats_lbl = tk.Label(top, text="", font=font(9), bg=SURFACE, fg=MUTED)
+        self.stats_lbl = tk.Label(top, text="", font=font(9, mono=True), bg=SURFACE, fg=MUTED)
         self.stats_lbl.pack(side="right", padx=(0, px(8)))
         self.progress = ProgressBar(inner, bg=SURFACE)
-        self.progress.grid(row=1, column=0, sticky="ew", pady=(px(10), 0))
+        self.progress.grid(row=1, column=0, sticky="ew", pady=(px(8), 0))
 
         btns = tk.Frame(inner, bg=SURFACE)
         btns.grid(row=0, column=1, rowspan=2, padx=(px(24), 0))
         self.cancel_btn = RButton(btns, "Cancel", self.cancel_transfer, "danger", height=44, pad=22, bg=SURFACE)
         self.send_btn = RButton(btns, "Send to phone", self.start_transfer, "primary", height=44,
-                                pad=30, size=11, weight="bold", bg=SURFACE)
+                                pad=32, size=10, weight="bold", bg=SURFACE)
         self.send_btn.pack(side="right")
 
     def _build_log(self):
@@ -985,14 +1164,14 @@ class App(tk.Tk):
         wrap = tk.Frame(self.log_frame, bg=SURFACE, padx=px(28), pady=px(4))
         wrap.pack(fill="both", expand=True)
         wrap.columnconfigure(0, weight=1)
-        self.log = tk.Text(wrap, height=9, state="disabled", wrap="word", bg=SURFACE, fg="#A8BACB",
+        self.log = tk.Text(wrap, height=9, state="disabled", wrap="word", bg=SURFACE, fg="#B4B7BE",
                            font=font(9, mono=True), relief="flat", bd=0, highlightthickness=0,
-                           padx=0, pady=px(6), selectbackground=ACCENT_WASH, spacing1=px(2))
+                           padx=0, pady=px(8), selectbackground=RAISED_HI, spacing1=px(2))
         sb = ttk.Scrollbar(wrap, orient="vertical", style="Dark.Vertical.TScrollbar", command=self.log.yview)
         self.log.configure(yscrollcommand=sb.set)
         self.log.grid(row=0, column=0, sticky="ew")
         sb.grid(row=0, column=1, sticky="ns", padx=(px(8), 0))
-        for tag, color in (("err", BAD), ("warn", WARN), ("cmd", ACCENT_HI), ("ok", OK)):
+        for tag, color in (("err", BAD), ("warn", WARN), ("cmd", TEXT), ("ok", OK)):
             self.log.tag_configure(tag, foreground=color)
         self._log_open = False
 
@@ -1036,16 +1215,16 @@ class App(tk.Tk):
 
     def alert(self, title, body, tone="info"):
         m = Modal(self, title, 420)
-        color = {"info": ACCENT, "error": BAD, "warn": WARN, "ok": OK}[tone]
+        color = {"info": MUTED, "error": BAD, "warn": WARN, "ok": OK}[tone]
         head = tk.Frame(m.body, bg=BG)
         head.pack(fill="x")
         dot = tk.Canvas(head, width=px(12), height=px(12), bg=BG, highlightthickness=0)
         dot.create_oval(1, 1, px(11), px(11), fill=color, outline="")
-        dot.pack(side="left", padx=(0, px(10)))
-        tk.Label(head, text=title, font=font(13, "bold"), bg=BG, fg=TEXT).pack(side="left")
+        dot.pack(side="left", padx=(0, px(8)))
+        tk.Label(head, text=title, font=font(14, "bold"), bg=BG, fg=TEXT).pack(side="left")
         tk.Label(m.body, text=body, font=font(10), bg=BG, fg=MUTED, justify="left", anchor="w",
                  wraplength=px(360)).pack(fill="x", pady=(px(12), px(20)))
-        RButton(m.body, "OK", m.destroy, "primary", height=38, pad=28, weight="bold").pack(anchor="e")
+        RButton(m.body, "OK", m.destroy, "primary", height=40, pad=28, weight="bold").pack(anchor="e")
         m.bind("<Return>", lambda e: m.destroy())
         m.present()
         m.wait_window()
@@ -1085,6 +1264,9 @@ class App(tk.Tk):
         cur = self.dest_var.get().strip().rstrip("/")
         for path, chip in self.chips.items():
             chip.set_kind("chip_on" if path.rstrip("/") == cur else "chip")
+        save = os.path.normcase(os.path.normpath(self.save_var.get().strip() or "."))
+        for path, chip in self.save_chips.items():
+            chip.set_kind("chip_on" if os.path.normcase(os.path.normpath(path)) == save else "chip")
 
     @staticmethod
     def _conn_type(serial):
@@ -1102,6 +1284,8 @@ class App(tk.Tk):
         short = serial if len(serial) <= 22 else serial[:10] + "…"
         self.route.set_device(self.models.get(serial, "Android device"),
                               f"{self._conn_type(serial)} · {short}")
+        if self.mode == "pull" and not self.sending:
+            self.browse(self.remote_path)
 
     # ---------------------------------------------------------- ADB / device
     def browse_adb(self):
@@ -1151,9 +1335,9 @@ class App(tk.Tk):
                 self.set_status(("1 phone connected" if len(labels) == 1 else f"{len(labels)} phones connected"), "dim")
         else:
             self.device_var.set("")
-            msg = "No phone found. Plug it in and turn on USB debugging."
+            msg = "No phone found. Plug it in and turn on USB debugging"
             if unauthorized:
-                msg = "Phone is locked out. Accept the Allow USB debugging prompt on the phone."
+                msg = "Phone is locked out. Accept the Allow USB debugging prompt on the phone"
             self.set_status(msg, "bad" if unauthorized else "dim")
             self.log_write(f"[info] {msg}")
         self._apply_device()
@@ -1213,15 +1397,15 @@ class App(tk.Tk):
         ]
         for i, text in enumerate(steps, 1):
             r = tk.Frame(b, bg=BG)
-            r.pack(fill="x", pady=(px(10) if i == 1 else px(6), 0))
-            c = tk.Canvas(r, width=px(22), height=px(22), bg=BG, highlightthickness=0)
-            c.create_oval(1, 1, px(22) - 1, px(22) - 1, fill=ACCENT_WASH, outline="")
-            c.create_text(px(11), px(11), text=str(i), font=font(9, "bold"), fill=ACCENT_HI)
-            c.pack(side="left", padx=(0, px(10)), anchor="n")
+            r.pack(fill="x", pady=(px(12) if i == 1 else px(8), 0))
+            c = tk.Canvas(r, width=px(24), height=px(24), bg=BG, highlightthickness=0)
+            c.create_oval(1, 1, px(24) - 1, px(24) - 1, fill=RAISED_HI, outline="")
+            c.create_text(px(12), px(12), text=str(i), font=font(9, "bold"), fill=TEXT)
+            c.pack(side="left", padx=(0, px(12)), anchor="n")
             tk.Label(r, text=text, font=font(10), bg=BG, fg=TEXT, justify="left", anchor="w",
                      wraplength=px(370)).pack(side="left", fill="x")
         tk.Label(b, text="The phone and this PC must be on the same Wi-Fi.", font=font(9), bg=BG,
-                 fg=MUTED, anchor="w").pack(fill="x", pady=(px(10), px(14)))
+                 fg=MUTED, anchor="w").pack(fill="x", pady=(px(12), px(16)))
 
         canvas = tk.Canvas(b, width=size, height=size, bg=BG, highlightthickness=0)
         canvas.pack()
@@ -1230,12 +1414,12 @@ class App(tk.Tk):
             for c_, filled in enumerate(row):
                 if filled:
                     x, y = (c_ + quiet) * cell, (r_ + quiet) * cell
-                    canvas.create_rectangle(x, y, x + cell, y + cell, fill="#0B121A", outline="")
+                    canvas.create_rectangle(x, y, x + cell, y + cell, fill="#0F1012", outline="")
 
         status = tk.StringVar(value="Waiting for the phone to scan…")
         status_lbl = tk.Label(b, textvariable=status, font=font(10), bg=BG, fg=MUTED,
                               wraplength=max(size, px(380)), justify="center")
-        status_lbl.pack(pady=(px(14), px(14)))
+        status_lbl.pack(pady=(px(16), px(16)))
 
         cancel = threading.Event()
         qq = queue.Queue()
@@ -1250,8 +1434,8 @@ class App(tk.Tk):
         bar = tk.Frame(b, bg=BG)
         bar.pack(fill="x")
         RButton(bar, "Pair with code instead", lambda: (close(), self.pair_with_code()), "quiet",
-                height=38, pad=12).pack(side="left")
-        btn = RButton(bar, "Cancel", close, "ghost", height=38, pad=22)
+                height=40, pad=12).pack(side="left")
+        btn = RButton(bar, "Cancel", close, "ghost", height=40, pad=22)
         btn.pack(side="right")
         m.protocol("WM_DELETE_WINDOW", close)
 
@@ -1397,7 +1581,7 @@ class App(tk.Tk):
 
         def labelled(text, placeholder):
             tk.Label(b, text=text, font=font(9), bg=BG, fg=MUTED, anchor="w").pack(
-                fill="x", pady=(px(10), px(6)))
+                fill="x", pady=(px(16), px(8)))
             f = Field(b, placeholder=placeholder, mono=True)
             f.pack(fill="x")
             return f
@@ -1408,7 +1592,7 @@ class App(tk.Tk):
         tk.Label(b, text="The connect address is on the main Wireless debugging screen. Its port "
                          "differs from the pairing port.",
                  font=font(9), bg=BG, fg=MUTED, justify="left", anchor="w",
-                 wraplength=px(380)).pack(fill="x", pady=(px(10), px(18)))
+                 wraplength=px(380)).pack(fill="x", pady=(px(16), px(24)))
 
         def go():
             pair, code, conn = f_pair.value(), f_code.value(), f_conn.value()
@@ -1453,7 +1637,7 @@ class App(tk.Tk):
                 else:
                     self.alert("Paired",
                                "Now enter the connect address from the Wireless debugging screen "
-                               "and press Connect in the main window.", "ok")
+                               "and press Connect in the main window", "ok")
             except Exception as e:  # noqa: BLE001
                 self.alert("Something went wrong", str(e), "error")
             finally:
@@ -1486,8 +1670,11 @@ class App(tk.Tk):
         self.after(0, lambda: self._add_paths(paths))
 
     def _add_paths(self, paths):
+        if self.mode != "push":
+            self.set_status("Switch to To phone to send files", "dim")
+            return
         if self.sending:
-            self.set_status("Wait for the current transfer to finish before adding more.", "dim")
+            self.set_status("Wait for the current transfer to finish before adding more", "dim")
             return
         fresh = []
         for p in paths:
@@ -1513,6 +1700,17 @@ class App(tk.Tk):
             self.q.put(("size", p, path_size(p)))
 
     def _update_count(self):
+        if self.mode == "pull":
+            n = len(self.sel)
+            if not n:
+                self.count_lbl.configure(text="")
+                return
+            known = [self.rsizes[p] for p in self.sel if p in self.rsizes]
+            text = f"{n} selected"
+            if len(known) == n:
+                text += f" · {human_size(sum(known))}"
+            self.count_lbl.configure(text=text)
+            return
         if not self.items:
             self.count_lbl.configure(text="")
             return
@@ -1526,7 +1724,8 @@ class App(tk.Tk):
         if self.items:
             self.dropzone.grid_remove()
             self.filelist.grid(row=0, column=0, sticky="nsew")
-            self.tools.pack(side="right")
+            if self.mode == "push":
+                self.tools.pack(side="right")
         else:
             self.filelist.grid_remove()
             self.tools.pack_forget()
@@ -1571,6 +1770,9 @@ class App(tk.Tk):
 
     # ------------------------------------------------------------ transfer
     def start_transfer(self):
+        if self.mode == "pull":
+            self._start_pull()
+            return
         if self.worker and self.worker.is_alive():
             return
         if not self.items:
@@ -1719,7 +1921,7 @@ class App(tk.Tk):
             return
         now = time.time()
         self.route.advance()
-        self.filelist.pulse()
+        self._active_list().pulse()
         target = self._bytes / self._total if self._total else 0
         self._disp += (target - self._disp) * 0.2
         self.progress.set(self._disp, ACCENT)
@@ -1733,11 +1935,253 @@ class App(tk.Tk):
             self.stats_lbl.configure(text=f"{human_size(self._bytes)} of {human_size(self._total)}")
         self.after(33, self._tick)
 
+    # --------------------------------------------------- From phone (pull)
+    def _active_list(self):
+        return self.phonelist if self.mode == "pull" else self.filelist
+
+    def _action_text(self):
+        return "Save to PC" if self.mode == "pull" else "Send to phone"
+
+    def _reset_route(self):
+        has = bool(self.selected_serial())
+        self.route.set_mode("ready" if has else "idle",
+                            ("Ready to save" if self.mode == "pull" else "Ready to send") if has else "Not connected")
+
+    def set_direction(self, mode):
+        if self.sending or mode == self.mode:
+            self.seg.set(self.mode)
+            return
+        self.mode = mode
+        self.seg.set(mode)
+        self.progress.set(0, ACCENT)
+        self.stats_lbl.configure(text="")
+        self._reset_route()
+        self.route.reverse = mode == "pull"
+        self.send_btn.set_text(self._action_text())
+        if mode == "pull":
+            self.push_stage.grid_remove()
+            self.tools.pack_forget()
+            self.pull_stage.grid(row=1, column=0, sticky="nsew")
+            self.push_dest.pack_forget()
+            self.pull_dest.pack(fill="x")
+            self.side_title.configure(text="Save to")
+            self.set_status("Click files or folders on the phone to select them", "dim")
+            self.browse(self.remote_path)
+        else:
+            self.pull_stage.grid_remove()
+            self.push_stage.grid(row=1, column=0, sticky="nsew")
+            self.pull_dest.pack_forget()
+            self.push_dest.pack(fill="x")
+            self.side_title.configure(text="Send to")
+            self._show_stage()
+            self.set_status("Add files to get started" if not self.items else
+                            f"{len(self.items)} item{'s' if len(self.items) != 1 else ''} ready to send",
+                            "dim" if not self.items else "normal")
+        self._update_count()
+
+    def browse_save(self):
+        p = filedialog.askdirectory(title="Choose where to save", initialdir=self.save_var.get() or None)
+        if p:
+            self.save_var.set(os.path.normpath(p))
+
+    def _browse_message(self, text):
+        if text:
+            self.browse_msg.configure(text=text)
+            self.browse_msg.place(in_=self.phonelist, relx=0.5, rely=0.4, anchor="center")
+            self.browse_msg.lift()
+        else:
+            self.browse_msg.place_forget()
+
+    def browse(self, path):
+        if self.sending:
+            return
+        self.sel = []
+        self._update_count()
+        serial = self.selected_serial()
+        if not path.endswith("/"):
+            path += "/"
+        self.remote_path = path
+        self.path_lbl.configure(text=ellipsize(path, font(10, mono=True), px(340), keep="end"))
+        self.up_btn.set_enabled(path != "/")
+        self._browse_gen += 1
+        gen = self._browse_gen
+        self.phonelist.clear()
+        if not serial:
+            self._browse_message("Connect a phone to browse its files")
+            return
+        self._browse_message("Loading…")
+        threading.Thread(target=self._ls_worker, args=(serial, path, gen), daemon=True).start()
+
+    def browse_up(self):
+        if self.sending:
+            return
+        parent = posixpath.dirname(self.remote_path.rstrip("/")) or "/"
+        self.browse(parent)
+
+    def _open_remote(self, path):
+        if not self.sending:
+            self.browse(path + "/")
+
+    def _ls_worker(self, serial, path, gen):
+        try:
+            r = subprocess.run([self.adb(), "-s", serial, "shell", "ls", "-lA", shlex.quote(path)],
+                               capture_output=True, text=True, timeout=25, env=ADB_ENV,
+                               creationflags=CREATE_NO_WINDOW)
+            entries, errors = parse_ls(r.stdout + "\n" + (r.stderr or ""))
+            self.q.put(("ls", gen, path, entries, " ".join(errors[:2])))
+        except Exception as e:  # noqa: BLE001
+            self.q.put(("ls", gen, path, [], str(e)))
+
+    def _toggle_remote(self, path):
+        row = self.phonelist.rows.get(path)
+        if not row or self.sending:
+            return
+        row.selected = not row.selected
+        row.redraw()
+        if row.selected:
+            if path not in self.sel:
+                self.sel.append(path)
+            if row.is_dir and path not in self.rsizes:
+                threading.Thread(target=self._du_bg, args=(path,), daemon=True).start()
+        elif path in self.sel:
+            self.sel.remove(path)
+        self._update_count()
+        n = len(self.sel)
+        self.set_status(f"{n} selected" if n else "Click files or folders on the phone to select them",
+                        "normal" if n else "dim")
+
+    def _remote_du(self, adb, serial, path):
+        try:
+            r = subprocess.run([adb, "-s", serial, "shell", "du", "-sk", shlex.quote(path)],
+                               capture_output=True, text=True, timeout=120, env=ADB_ENV,
+                               creationflags=CREATE_NO_WINDOW)
+            return int(r.stdout.split()[0]) * 1024
+        except Exception:
+            return 0
+
+    def _du_bg(self, path):
+        serial = self.selected_serial()
+        if serial:
+            self.q.put(("rsize", path, self._remote_du(self.adb(), serial, path)))
+
+    def _start_pull(self):
+        if self.worker and self.worker.is_alive():
+            return
+        if not self.sel:
+            self.alert("Nothing selected",
+                       "Click the files or folders you want to save. Double-click a folder to open it.", "info")
+            return
+        serial = self.selected_serial()
+        if not serial:
+            self.refresh_devices()
+            serial = self.selected_serial()
+            if not serial:
+                self.alert("No phone selected",
+                           "Connect a phone with USB debugging on, or pair one over Wi-Fi, then try again.",
+                           "error")
+                return
+        dest = self.save_var.get().strip()
+        if not dest:
+            self.alert("Choose a folder", "Pick the folder on this PC where the files should be saved.", "info")
+            return
+        try:
+            os.makedirs(dest, exist_ok=True)
+        except OSError as e:
+            self.alert("Can't use that folder", str(e), "error")
+            return
+        try:
+            adb = self.adb()
+        except FileNotFoundError as e:
+            self.alert("adb not found", str(e), "error")
+            return
+
+        items = list(self.sel)
+        self.cancel_flag.clear()
+        self.sending = True
+        self.phonelist.reset_states()
+        self.phonelist.set_removable(False)
+        self.send_btn.set_text("Saving…")
+        self.send_btn.set_enabled(False)
+        self.cancel_btn.pack(side="right", padx=(0, px(8)))
+        self._bytes = self._last_bytes = 0
+        self._total = sum(self.rsizes.get(p, 0) for p in items)
+        self._disp, self._speed = 0.0, 0.0
+        self._t0 = self._last_t = time.time()
+        self._index = (0, len(items))
+        self.progress.set(0, ACCENT)
+        self.stats_lbl.configure(text="")
+        self.route.set_mode("sending", f"0 of {len(items)}")
+        self.worker = threading.Thread(target=self._pull_worker, args=(adb, serial, dest, items), daemon=True)
+        self.worker.start()
+        self.after(33, self._tick)
+
+    def _poll_local(self, local, size, base, stop, q):
+        """Watch the file or folder growing on the PC."""
+        while not stop.wait(0.5):
+            try:
+                n = path_size(local) if os.path.exists(local) else 0
+            except Exception:
+                continue
+            q.put(("bytes", base + min(n, size)))
+
+    def _pull_worker(self, adb, serial, dest, items):
+        q = self.q
+        ok = failed = 0
+        try:
+            sizes = {p: (self.rsizes[p] if p in self.rsizes else self._remote_du(adb, serial, p)) for p in items}
+            q.put(("total", sum(sizes.values())))
+            base = 0
+            total = len(items)
+            for i, path in enumerate(items, 1):
+                if self.cancel_flag.is_set():
+                    q.put(("log", "[cancelled]"))
+                    break
+                name = posixpath.basename(path.rstrip("/"))
+                size = sizes[path]
+                q.put(("file", path, "sending"))
+                q.put(("index", i, total))
+                q.put(("status", f"Saving {name}"))
+                q.put(("log", f"> {path}  ->  {dest}"))
+                self.proc = subprocess.Popen(
+                    [adb, "-s", serial, "pull", path, dest],
+                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=ADB_ENV,
+                    creationflags=CREATE_NO_WINDOW)
+                stop = threading.Event()
+                threading.Thread(target=self._poll_local,
+                                 args=(os.path.join(dest, name), size, base, stop, q), daemon=True).start()
+                last = ""
+                for line in self.proc.stdout:
+                    line = line.strip()
+                    if line:
+                        last = line
+                        if not line.startswith("[") or "pulled" in line:
+                            q.put(("log", line))
+                self.proc.wait()
+                stop.set()
+                if self.cancel_flag.is_set():
+                    q.put(("file", path, "queued"))
+                    q.put(("log", "[cancelled]"))
+                    break
+                base += size
+                if self.proc.returncode == 0:
+                    ok += 1
+                    q.put(("file", path, "done"))
+                else:
+                    failed += 1
+                    q.put(("file", path, "failed"))
+                    q.put(("log", f"[failed] {name}: {last}"))
+                q.put(("bytes", base))
+            q.put(("done", ok, failed, self.cancel_flag.is_set(), dest))
+        except Exception as e:  # noqa: BLE001
+            q.put(("log", f"[error] {e}"))
+            q.put(("done", ok, failed + 1, False, dest))
+
     def _finish(self, ok, failed, cancelled, dest):
+        word = "Saved" if self.mode == "pull" else "Sent"
         self.sending = False
         elapsed = max(time.time() - self._t0, 0.1)
-        self.filelist.set_removable(True)
-        self.send_btn.set_text("Send to phone")
+        self._active_list().set_removable(True)
+        self.send_btn.set_text(self._action_text())
         self.send_btn.set_enabled(True)
         self.cancel_btn.pack_forget()
         avg = f" · {human_size(self._total / elapsed)}/s" if self._total and ok else ""
@@ -1745,19 +2189,19 @@ class App(tk.Tk):
         if cancelled:
             self.route.set_mode("ready", "Cancelled")
             self.progress.set(self._disp, FAINT)
-            self.set_status(f"Cancelled. {ok} sent, {failed} failed.", "dim")
+            self.set_status(f"Cancelled. {ok} {word.lower()}, {failed} failed", "dim")
         elif failed:
             self.route.set_mode("error", f"{failed} failed")
             self.progress.set(1.0, BAD)
-            self.set_status(f"Finished with errors: {ok} sent, {failed} failed.", "bad")
+            self.set_status(f"Finished with errors: {ok} {word.lower()}, {failed} failed", "bad")
             self.stats_lbl.configure(text=summary)
         else:
-            self.route.set_mode("done", "Sent")
+            self.route.set_mode("done", word)
             self.progress.set(1.0, OK)
             noun = "item" if ok == 1 else "items"
-            self.set_status(f"Sent {ok} {noun} to {dest}", "ok")
+            self.set_status(f"{word} {ok} {noun} to {dest}", "ok")
             self.stats_lbl.configure(text=summary)
-            self.log_write(f"Sent {ok} {noun} to {dest}")
+            self.log_write(f"{word} {ok} {noun} to {dest}")
 
     def _drain_queue(self):
         try:
@@ -1775,7 +2219,33 @@ class App(tk.Tk):
                         self.filelist.set_size(path, human_size(n))
                         self._update_count()
                 elif kind == "file":
-                    self.filelist.set_state(msg[1], msg[2])
+                    self._active_list().set_state(msg[1], msg[2])
+                elif kind == "rsize":
+                    _k, path, n = msg
+                    self.rsizes[path] = n
+                    self.phonelist.set_size(path, human_size(n))
+                    self._update_count()
+                elif kind == "ls":
+                    _k, gen, path, entries, err = msg
+                    if gen == self._browse_gen and self.mode == "pull":
+                        self.phonelist.clear()
+                        self.sel, self.rsizes, self.rdirs = [], {}, set()
+                        for e in entries:
+                            p = path + e["name"]
+                            if e["dir"]:
+                                self.rdirs.add(p)
+                            else:
+                                self.rsizes[p] = e["size"]
+                            self.phonelist.add(p, remote=True, is_dir=e["dir"], meta=e["meta"],
+                                               size_text="" if e["dir"] else human_size(e["size"]),
+                                               on_toggle=self._toggle_remote, on_open=self._open_remote)
+                        if entries:
+                            self._browse_message("")
+                        elif err:
+                            self._browse_message("Can't open this folder.\n" + ellipsize(err, font(9), px(380)))
+                        else:
+                            self._browse_message("This folder is empty")
+                        self._update_count()
                 elif kind == "index":
                     self._index = (msg[1], msg[2])
                 elif kind == "total":
